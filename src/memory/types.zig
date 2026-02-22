@@ -4,6 +4,13 @@
 //! enabling future tasks (episodic/semantic split, confidence decay,
 //! SQLite migration) to work with well-defined record kinds and tiers.
 //! This module is schema-only — no storage logic or migrations.
+//!
+//! ## Integration TODOs (S2-MEM-001)
+//! - Add EpisodicMeta / SemanticMeta fields to TypedRecord (requires migration)
+//! - Populate decay params from MemoryKind via decay.defaultParamsForKind()
+//! - Apply decayConfidence() during recall/search ranking in backends
+//! - Wire reinforceConfidence() into memory_store when updating semantic facts
+//! - Add consolidated flag tracking for episodic -> semantic consolidation
 
 const std = @import("std");
 

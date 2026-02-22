@@ -20,6 +20,7 @@ pub const vector = @import("vector.zig");
 pub const hygiene = @import("hygiene.zig");
 pub const snapshot = @import("snapshot.zig");
 pub const types = @import("types.zig");
+pub const decay = @import("decay.zig");
 
 pub const SqliteMemory = sqlite.SqliteMemory;
 pub const MarkdownMemory = markdown.MarkdownMemory;
@@ -44,6 +45,18 @@ pub const RetentionTier = types.RetentionTier;
 pub const SourceMeta = types.SourceMeta;
 pub const Confidence = types.Confidence;
 pub const TypedRecord = types.TypedRecord;
+
+// Confidence decay and episodic/semantic primitives (S2-MEM-001)
+pub const DecayModel = decay.DecayModel;
+pub const DecayParams = decay.DecayParams;
+pub const EpisodicMeta = decay.EpisodicMeta;
+pub const SemanticMeta = decay.SemanticMeta;
+pub const computeDecay = decay.computeDecay;
+pub const decayConfidence = decay.decayConfidence;
+pub const recencyScore = decay.recencyScore;
+pub const recencyScoreFromTimestamps = decay.recencyScoreFromTimestamps;
+pub const defaultParamsForKind = decay.defaultParamsForKind;
+pub const reinforceConfidence = decay.reinforceConfidence;
 
 // ── Memory categories ──────────────────────────────────────────────
 
@@ -450,4 +463,5 @@ test {
     _ = hygiene;
     _ = snapshot;
     _ = types;
+    _ = decay;
 }
