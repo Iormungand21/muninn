@@ -19,6 +19,7 @@ pub const embeddings = @import("embeddings.zig");
 pub const vector = @import("vector.zig");
 pub const hygiene = @import("hygiene.zig");
 pub const snapshot = @import("snapshot.zig");
+pub const types = @import("types.zig");
 
 pub const SqliteMemory = sqlite.SqliteMemory;
 pub const MarkdownMemory = markdown.MarkdownMemory;
@@ -36,6 +37,13 @@ pub const HygieneReport = hygiene.HygieneReport;
 pub const exportSnapshot = snapshot.exportSnapshot;
 pub const hydrateFromSnapshot = snapshot.hydrateFromSnapshot;
 pub const shouldHydrate = snapshot.shouldHydrate;
+
+// Typed memory schema (S1-MEM-001)
+pub const MemoryKind = types.MemoryKind;
+pub const RetentionTier = types.RetentionTier;
+pub const SourceMeta = types.SourceMeta;
+pub const Confidence = types.Confidence;
+pub const TypedRecord = types.TypedRecord;
 
 // ── Memory categories ──────────────────────────────────────────────
 
@@ -441,4 +449,5 @@ test {
     _ = vector;
     _ = hygiene;
     _ = snapshot;
+    _ = types;
 }
