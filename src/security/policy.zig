@@ -1,5 +1,6 @@
 const std = @import("std");
 pub const RateTracker = @import("tracker.zig").RateTracker;
+const scope = @import("scope.zig");
 
 /// How much autonomy the agent has
 pub const AutonomyLevel = enum {
@@ -218,6 +219,32 @@ pub const SecurityPolicy = struct {
     tracker: ?*RateTracker = null,
     /// Optional hook invoked on every policy denial for observability.
     deny_hook: ?PolicyDenyHook = null,
+    /// Per-workspace policy overrides. When set, `resolveForWorkspace()` can
+    /// produce a copy of this policy with workspace-specific settings applied.
+    workspace_policies: []const scope.WorkspaceApprovalPolicy = &.{},
+
+    /// Return a copy of this policy with workspace-specific overrides applied.
+    /// Looks up the workspace in `workspace_policies` and resolves each field
+    /// using the scope resolve helpers. If no override exists for the given
+    /// workspace, the returned policy is identical to `self`.
+    pub fn resolveForWorkspace(self: *const SecurityPolicy, workspace_id: []const u8) SecurityPolicy {
+        const wp = scope.findWorkspacePolicy(self.workspace_policies, workspace_id);
+        var resolved = self.*;
+        resolved.autonomy = scope.resolveAutonomy(self.autonomy, wp);
+        resolved.require_approval_for_medium_risk = scope.resolveApprovalForMediumRisk(
+            self.require_approval_for_medium_risk,
+            wp,
+        );
+        resolved.block_high_risk_commands = scope.resolveBlockHighRisk(
+            self.block_high_risk_commands,
+            wp,
+        );
+        resolved.max_actions_per_hour = scope.resolveMaxActionsPerHour(
+            self.max_actions_per_hour,
+            wp,
+        );
+        return resolved;
+    }
 
     /// Classify command risk level.
     pub fn commandRiskLevel(self: *const SecurityPolicy, command: []const u8) CommandRiskLevel {
@@ -1638,4 +1665,76 @@ test "validateCommandDetailed consistent with validateCommandExecution" {
     const new_deny = p.validateCommandDetailed("python3 exploit.py", false);
     try std.testing.expectError(error.CommandNotAllowed, old_deny);
     try std.testing.expect(new_deny.isDenied());
+}
+
+// ── resolveForWorkspace tests ───────────────────────────────────────
+
+test "resolveForWorkspace: no override returns same policy" {
+    const p = SecurityPolicy{
+        .autonomy = .supervised,
+        .require_approval_for_medium_risk = true,
+        .block_high_risk_commands = true,
+        .max_actions_per_hour = 20,
+    };
+    const resolved = p.resolveForWorkspace("unknown_ws");
+    try std.testing.expectEqual(AutonomyLevel.supervised, resolved.autonomy);
+    try std.testing.expect(resolved.require_approval_for_medium_risk);
+    try std.testing.expect(resolved.block_high_risk_commands);
+    try std.testing.expectEqual(@as(u32, 20), resolved.max_actions_per_hour);
+}
+
+test "resolveForWorkspace: workspace override applied" {
+    const ws_policies = [_]scope.WorkspaceApprovalPolicy{
+        .{
+            .workspace_id = "dev",
+            .autonomy = .full,
+            .require_approval_for_medium_risk = false,
+            .block_high_risk_commands = false,
+            .max_actions_per_hour = 100,
+        },
+        .{
+            .workspace_id = "prod",
+            .autonomy = .read_only,
+        },
+    };
+    const p = SecurityPolicy{
+        .autonomy = .supervised,
+        .require_approval_for_medium_risk = true,
+        .block_high_risk_commands = true,
+        .max_actions_per_hour = 20,
+        .workspace_policies = &ws_policies,
+    };
+
+    // Dev workspace: full autonomy, relaxed settings
+    const dev = p.resolveForWorkspace("dev");
+    try std.testing.expectEqual(AutonomyLevel.full, dev.autonomy);
+    try std.testing.expect(!dev.require_approval_for_medium_risk);
+    try std.testing.expect(!dev.block_high_risk_commands);
+    try std.testing.expectEqual(@as(u32, 100), dev.max_actions_per_hour);
+
+    // Prod workspace: read_only, inherits other defaults
+    const prod = p.resolveForWorkspace("prod");
+    try std.testing.expectEqual(AutonomyLevel.read_only, prod.autonomy);
+    try std.testing.expect(prod.require_approval_for_medium_risk); // inherited
+    try std.testing.expect(prod.block_high_risk_commands); // inherited
+    try std.testing.expectEqual(@as(u32, 20), prod.max_actions_per_hour); // inherited
+}
+
+test "resolveForWorkspace: resolved policy enforces workspace autonomy" {
+    const ws_policies = [_]scope.WorkspaceApprovalPolicy{
+        .{ .workspace_id = "locked", .autonomy = .read_only },
+    };
+    const p = SecurityPolicy{
+        .autonomy = .full,
+        .workspace_policies = &ws_policies,
+    };
+
+    // The locked workspace should block all commands
+    const resolved = p.resolveForWorkspace("locked");
+    try std.testing.expect(!resolved.canAct());
+    try std.testing.expect(!resolved.isCommandAllowed("ls"));
+
+    // An unlisted workspace keeps global full autonomy
+    const other = p.resolveForWorkspace("other");
+    try std.testing.expect(other.canAct());
 }

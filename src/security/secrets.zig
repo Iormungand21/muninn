@@ -1,6 +1,7 @@
 const std = @import("std");
 const ChaCha20Poly1305 = std.crypto.aead.chacha_poly.ChaCha20Poly1305;
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
+const scope = @import("scope.zig");
 const log = std.log.scoped(.secrets);
 
 /// Length of the random encryption key in bytes (256-bit).
@@ -191,6 +192,23 @@ pub const SecretStore = struct {
         const decrypted = decrypt(key, nonce, ciphertext, &plain_buf) catch return error.DecryptionFailed;
 
         return try allocator.dupe(u8, decrypted);
+    }
+
+    /// Decrypt a secret with scope enforcement.
+    /// Returns `error.SecretAccessDenied` if the secret's scope restrictions
+    /// do not permit access from the given workspace/channel.
+    pub fn decryptSecretScoped(
+        self: *const SecretStore,
+        allocator: std.mem.Allocator,
+        value: []const u8,
+        entry: *const scope.ScopedSecretEntry,
+        workspace_id: []const u8,
+        channel_id: []const u8,
+    ) ![]u8 {
+        if (!scope.isSecretAccessible(entry, workspace_id, channel_id)) {
+            return error.SecretAccessDenied;
+        }
+        return self.decryptSecret(allocator, value);
     }
 
     /// Check if a value is encrypted
@@ -653,4 +671,82 @@ test "secret store encrypt decrypt multiple values same store" {
         defer std.testing.allocator.free(dec);
         try std.testing.expectEqualStrings(expected, dec);
     }
+}
+
+// ── Scoped secret retrieval tests ────────────────────────────────
+
+test "decryptSecretScoped: global secret accessible from any workspace" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    const store = SecretStore.init(tmp_path, true);
+    const encrypted = try store.encryptSecret(std.testing.allocator, "global-api-key");
+    defer std.testing.allocator.free(encrypted);
+
+    const entry = scope.ScopedSecretEntry{ .name = "api_key", .scope = .global };
+
+    // Accessible from any workspace/channel
+    const d1 = try store.decryptSecretScoped(std.testing.allocator, encrypted, &entry, "ws1", "discord");
+    defer std.testing.allocator.free(d1);
+    try std.testing.expectEqualStrings("global-api-key", d1);
+
+    const d2 = try store.decryptSecretScoped(std.testing.allocator, encrypted, &entry, "ws2", "slack");
+    defer std.testing.allocator.free(d2);
+    try std.testing.expectEqualStrings("global-api-key", d2);
+}
+
+test "decryptSecretScoped: workspace-scoped secret denied to wrong workspace" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    const store = SecretStore.init(tmp_path, true);
+    const encrypted = try store.encryptSecret(std.testing.allocator, "ws-secret");
+    defer std.testing.allocator.free(encrypted);
+
+    const allowed_ws = [_][]const u8{ "ws_alpha", "ws_beta" };
+    const entry = scope.ScopedSecretEntry{
+        .name = "restricted_key",
+        .scope = .workspace,
+        .allowed_workspaces = &allowed_ws,
+    };
+
+    // Allowed workspace succeeds
+    const d1 = try store.decryptSecretScoped(std.testing.allocator, encrypted, &entry, "ws_alpha", "any");
+    defer std.testing.allocator.free(d1);
+    try std.testing.expectEqualStrings("ws-secret", d1);
+
+    // Wrong workspace denied
+    const result = store.decryptSecretScoped(std.testing.allocator, encrypted, &entry, "ws_gamma", "any");
+    try std.testing.expectError(error.SecretAccessDenied, result);
+}
+
+test "decryptSecretScoped: channel-scoped secret denied to wrong channel" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    const store = SecretStore.init(tmp_path, true);
+    const encrypted = try store.encryptSecret(std.testing.allocator, "channel-token");
+    defer std.testing.allocator.free(encrypted);
+
+    const allowed_ch = [_][]const u8{ "discord", "slack" };
+    const entry = scope.ScopedSecretEntry{
+        .name = "bot_token",
+        .scope = .channel,
+        .allowed_channels = &allowed_ch,
+    };
+
+    // Allowed channel succeeds
+    const d1 = try store.decryptSecretScoped(std.testing.allocator, encrypted, &entry, "ws1", "discord");
+    defer std.testing.allocator.free(d1);
+    try std.testing.expectEqualStrings("channel-token", d1);
+
+    // Wrong channel denied
+    const result = store.decryptSecretScoped(std.testing.allocator, encrypted, &entry, "ws1", "webhook");
+    try std.testing.expectError(error.SecretAccessDenied, result);
 }
