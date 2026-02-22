@@ -16,3 +16,20 @@ done	M3-DEL-001	muninn	M3	Remote planning delegation client stub to huginn	autom
 done	X1-SYNC-001	sync	X1	Shared sync protocol types and schema versioning	automation/tasks/X1-SYNC-001.md	Added src/sync/protocol.zig with SchemaVersion, NodeRole, DeltaKind, DeltaOp, SyncDirection, AckStatus, EventDelta, TaskDelta, MemoryDelta, SyncEnvelope, SyncAck, serializeEnvelope, serializeAck; src/sync/root.zig re-exports; SyncConfig in config_types.zig; docs/sync-protocol.md skeleton; exported from root.zig; 31/31 tests pass
 done	X2-SYNC-001	sync	X2	Conflict resolution policy implementation skeleton	automation/tasks/X2-SYNC-001.md	Added src/sync/conflict.zig with ConflictSide, ConflictOutcome, ConflictRecord, resolveBySourceOwnership, resolveByConfirmedAt, resolveByConfidence, resolveByUpdatedAt, resolveTask, resolveMemory, resolve; re-exported from sync/root.zig; 29 new tests (61 total in sync module); all pass
 done	X3-SYNC-001	sync	X3	Federated task routing handshake and heartbeat message flow	automation/tasks/X3-SYNC-001.md	Added src/sync/handshake.zig with HandshakePhase, HandshakeIntent, NodeHealth, ConnectionState, HandshakeInit, HandshakeResponse, Heartbeat, HeartbeatAck; state transition helpers (send/receive init/accept/reject, fail, reset); heartbeat miss/success processing; JSONL serialization; re-exported from sync/root.zig; docs/sync-protocol.md updated; 38 new tests (99 total in sync module); all pass
+pending	S3-SEC-001	shared	S3	Wire secret scope enforcement into retrieval path	automation/tasks/S3-SEC-001.md	
+pending	S3-SEC-002	shared	S3	Implement Landlock syscall bindings for sandbox backend	automation/tasks/S3-SEC-002.md	
+pending	S3-MEM-001	shared	S3	Wire confidence decay into memory recall ranking	automation/tasks/S3-MEM-001.md	
+pending	S3-MEM-002	shared	S3	Wire hybrid vector+keyword search end-to-end	automation/tasks/S3-MEM-002.md	
+pending	S3-TOOL-001	shared	S3	Adopt reliability framework in shell, http_request, web_search tools	automation/tasks/S3-TOOL-001.md	
+pending	S3-OBS-001	shared	S3	Implement event replay JSONL parsing and stats computation	automation/tasks/S3-OBS-001.md	
+pending	M4-CHAN-001	muninn	M4	Implement Slack Socket Mode for real-time message receiving	automation/tasks/M4-CHAN-001.md	
+pending	M4-CHAN-002	muninn	M4	Add Discord slash command registration and handling	automation/tasks/M4-CHAN-002.md	
+pending	M4-OFF-001	muninn	M4	Complete offline queue with JSONL persistence and drain loop	automation/tasks/M4-OFF-001.md	
+pending	M4-DEL-001	muninn	M4	Wire delegation client HTTP transport for plan requests	automation/tasks/M4-DEL-001.md	
+pending	M4-MEM-001	muninn	M4	SQLite schema migration for TypedRecord metadata columns	automation/tasks/M4-MEM-001.md	
+pending	M4-GW-001	muninn	M4	Replace gateway subprocess fallback with graceful error	automation/tasks/M4-GW-001.md	
+pending	M5-CHAN-001	muninn	M5	Add Discord thread support for long conversations	automation/tasks/M5-CHAN-001.md	
+pending	M5-MEM-001	muninn	M5	Implement episodic-to-semantic memory consolidation	automation/tasks/M5-MEM-001.md	
+pending	M5-SEC-001	muninn	M5	Add audit log querying CLI command	automation/tasks/M5-SEC-001.md	
+pending	M5-TOOL-001	muninn	M5	Per-tool timeout configuration and usage analytics	automation/tasks/M5-TOOL-001.md	
+pending	M5-GW-001	muninn	M5	Expand /health endpoint with component-level status	automation/tasks/M5-GW-001.md	
