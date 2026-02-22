@@ -298,6 +298,29 @@ pub const ComposioConfig = struct {
 
 pub const SecretsConfig = struct {
     encrypt: bool = true,
+    /// Per-secret scope rules. Empty = all secrets are global (backward compatible).
+    scoped_secrets: []const ScopedSecretConfig = &.{},
+};
+
+/// Config representation of a scoped secret entry.
+pub const ScopedSecretConfig = struct {
+    name: []const u8 = "",
+    scope: []const u8 = "global", // "global", "workspace", "channel"
+    allowed_workspaces: []const []const u8 = &.{},
+    allowed_channels: []const []const u8 = &.{},
+};
+
+// ── Workspace approval policy config ────────────────────────────
+
+/// Per-workspace overrides for approval/autonomy policy.
+/// Any null/default field means "inherit from global".
+pub const WorkspaceApprovalPolicyConfig = struct {
+    workspace_id: []const u8 = "",
+    autonomy: ?[]const u8 = null, // "readonly", "supervised", "full"
+    require_approval_for_medium_risk: ?bool = null,
+    block_high_risk_commands: ?bool = null,
+    max_actions_per_hour: ?u32 = null,
+    additional_commands: []const []const u8 = &.{},
 };
 
 // ── Browser config ──────────────────────────────────────────────
@@ -407,6 +430,8 @@ pub const SecurityConfig = struct {
     audit: AuditConfig = .{},
     /// Discord/Telegram user ID of the bot owner. Only this user can use privileged tools.
     owner_id: []const u8 = "",
+    /// Per-workspace approval policy overrides. Empty = use global defaults.
+    workspace_policies: []const WorkspaceApprovalPolicyConfig = &.{},
 };
 
 // ── Delegate agent config ───────────────────────────────────────
