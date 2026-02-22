@@ -34,6 +34,10 @@ pub const CommandExecutionLog = audit.CommandExecutionLog;
 pub const AutonomyLevel = policy.AutonomyLevel;
 pub const CommandRiskLevel = policy.CommandRiskLevel;
 pub const SecurityPolicy = policy.SecurityPolicy;
+pub const DenyCode = policy.DenyCode;
+pub const PolicyDeny = policy.PolicyDeny;
+pub const PolicyResult = policy.PolicyResult;
+pub const PolicyDenyHook = policy.PolicyDenyHook;
 
 pub const PairingGuard = pairing.PairingGuard;
 pub const constantTimeEq = pairing.constantTimeEq;

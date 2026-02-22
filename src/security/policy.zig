@@ -43,7 +43,154 @@ pub const CommandRiskLevel = enum {
             .high => "high",
         };
     }
+
+    pub fn fromString(s: []const u8) ?CommandRiskLevel {
+        if (std.mem.eql(u8, s, "low")) return .low;
+        if (std.mem.eql(u8, s, "medium")) return .medium;
+        if (std.mem.eql(u8, s, "high")) return .high;
+        return null;
+    }
 };
+
+// ── Structured policy deny ──────────────────────────────────────────
+
+/// Why a command was denied.
+pub const DenyCode = enum {
+    /// Autonomy level is read_only — no actions permitted.
+    read_only,
+    /// Command exceeds maximum analysis length.
+    oversized,
+    /// Shell injection vector detected (backticks, $(), ${}, etc.).
+    injection,
+    /// Process substitution detected (<() or >()).
+    process_substitution,
+    /// Background chaining (&) detected.
+    background_chain,
+    /// Output redirection (>) detected.
+    redirect,
+    /// `tee` command blocked (arbitrary file write).
+    tee_blocked,
+    /// Command not in allowlist.
+    not_allowed,
+    /// Dangerous arguments for the command.
+    unsafe_args,
+    /// High-risk command blocked by policy.
+    high_risk_blocked,
+    /// Medium/high-risk command requires approval.
+    approval_required,
+    /// Rate limit exceeded.
+    rate_limited,
+
+    pub fn toString(self: DenyCode) []const u8 {
+        return switch (self) {
+            .read_only => "read_only",
+            .oversized => "oversized",
+            .injection => "injection",
+            .process_substitution => "process_substitution",
+            .background_chain => "background_chain",
+            .redirect => "redirect",
+            .tee_blocked => "tee_blocked",
+            .not_allowed => "not_allowed",
+            .unsafe_args => "unsafe_args",
+            .high_risk_blocked => "high_risk_blocked",
+            .approval_required => "approval_required",
+            .rate_limited => "rate_limited",
+        };
+    }
+
+    pub fn fromString(s: []const u8) ?DenyCode {
+        if (std.mem.eql(u8, s, "read_only")) return .read_only;
+        if (std.mem.eql(u8, s, "oversized")) return .oversized;
+        if (std.mem.eql(u8, s, "injection")) return .injection;
+        if (std.mem.eql(u8, s, "process_substitution")) return .process_substitution;
+        if (std.mem.eql(u8, s, "background_chain")) return .background_chain;
+        if (std.mem.eql(u8, s, "redirect")) return .redirect;
+        if (std.mem.eql(u8, s, "tee_blocked")) return .tee_blocked;
+        if (std.mem.eql(u8, s, "not_allowed")) return .not_allowed;
+        if (std.mem.eql(u8, s, "unsafe_args")) return .unsafe_args;
+        if (std.mem.eql(u8, s, "high_risk_blocked")) return .high_risk_blocked;
+        if (std.mem.eql(u8, s, "approval_required")) return .approval_required;
+        if (std.mem.eql(u8, s, "rate_limited")) return .rate_limited;
+        return null;
+    }
+
+    /// Human-readable explanation for UI/logging.
+    pub fn message(self: DenyCode) []const u8 {
+        return switch (self) {
+            .read_only => "agent is in read-only mode and cannot execute commands",
+            .oversized => "command exceeds maximum allowed length",
+            .injection => "shell injection pattern detected",
+            .process_substitution => "process substitution is not allowed",
+            .background_chain => "background execution (&) is not allowed",
+            .redirect => "output redirection is not allowed",
+            .tee_blocked => "tee command is blocked (can write to arbitrary files)",
+            .not_allowed => "command is not in the allowlist",
+            .unsafe_args => "command contains unsafe arguments",
+            .high_risk_blocked => "high-risk command is blocked by policy",
+            .approval_required => "command requires explicit approval",
+            .rate_limited => "action rate limit exceeded",
+        };
+    }
+};
+
+/// Structured deny result with code, message, and matched-rule context.
+pub const PolicyDeny = struct {
+    /// Machine-readable deny reason.
+    code: DenyCode,
+    /// Risk level assessed at time of denial (null if denied before risk assessment).
+    risk: ?CommandRiskLevel = null,
+    /// The command (or prefix) that triggered the denial.
+    command: ?[]const u8 = null,
+    /// Specific pattern or rule that matched (e.g. "rm", "`", "$(").
+    matched_rule: ?[]const u8 = null,
+
+    /// Human-readable explanation (delegates to DenyCode.message).
+    pub fn message(self: *const PolicyDeny) []const u8 {
+        return self.code.message();
+    }
+
+    /// Serialize into a fixed buffer for logging. Returns written slice or null
+    /// if the buffer is too small.
+    pub fn writeJson(self: *const PolicyDeny, buf: []u8) ?[]const u8 {
+        var fbs = std.io.fixedBufferStream(buf);
+        const w = fbs.writer();
+        w.print("{{\"code\":\"{s}\",\"message\":\"{s}\"", .{
+            self.code.toString(),
+            self.code.message(),
+        }) catch return null;
+        if (self.risk) |r| {
+            w.print(",\"risk\":\"{s}\"", .{r.toString()}) catch return null;
+        }
+        if (self.matched_rule) |rule| {
+            w.print(",\"matched_rule\":\"{s}\"", .{rule}) catch return null;
+        }
+        w.writeAll("}") catch return null;
+        return fbs.getWritten();
+    }
+};
+
+/// Result of a detailed policy check: either allowed with a risk level, or
+/// denied with structured context. This replaces error-based flow for callers
+/// that need explainability.
+pub const PolicyResult = union(enum) {
+    /// Command is allowed; payload is the assessed risk level.
+    allowed: CommandRiskLevel,
+    /// Command is denied; payload has structured context.
+    denied: PolicyDeny,
+
+    pub fn isAllowed(self: PolicyResult) bool {
+        return self == .allowed;
+    }
+
+    pub fn isDenied(self: PolicyResult) bool {
+        return self == .denied;
+    }
+};
+
+/// Callback signature for policy-deny event hooks.
+/// Implementations should be lightweight (e.g. append to a queue or log).
+/// The `deny` pointer is only valid for the duration of the call.
+pub const PolicyDenyHook = *const fn (deny: *const PolicyDeny) void;
 
 /// High-risk commands that are always blocked/require elevated approval.
 const high_risk_commands = [_][]const u8{
@@ -69,6 +216,8 @@ pub const SecurityPolicy = struct {
     require_approval_for_medium_risk: bool = true,
     block_high_risk_commands: bool = true,
     tracker: ?*RateTracker = null,
+    /// Optional hook invoked on every policy denial for observability.
+    deny_hook: ?PolicyDenyHook = null,
 
     /// Classify command risk level.
     pub fn commandRiskLevel(self: *const SecurityPolicy, command: []const u8) CommandRiskLevel {
@@ -243,6 +392,130 @@ pub const SecurityPolicy = struct {
             return tracker.isLimited();
         }
         return false;
+    }
+
+    /// Detailed command allowlist check returning structured deny on failure.
+    pub fn isCommandAllowedDetailed(self: *const SecurityPolicy, command: []const u8) ?PolicyDeny {
+        if (self.autonomy == .read_only) return .{ .code = .read_only };
+
+        if (command.len > MAX_ANALYSIS_LEN) return .{ .code = .oversized };
+
+        // Block subshell/expansion operators
+        if (containsStr(command, "`")) return .{ .code = .injection, .matched_rule = "`" };
+        if (containsStr(command, "$(")) return .{ .code = .injection, .matched_rule = "$(" };
+        if (containsStr(command, "${")) return .{ .code = .injection, .matched_rule = "${" };
+
+        // Block process substitution
+        if (containsStr(command, "<(")) return .{ .code = .process_substitution, .matched_rule = "<(" };
+        if (containsStr(command, ">(")) return .{ .code = .process_substitution, .matched_rule = ">(" };
+
+        // Block Windows %VAR% environment variable expansion (cmd.exe attack surface)
+        if (comptime @import("builtin").os.tag == .windows) {
+            if (hasPercentVar(command)) return .{ .code = .injection, .matched_rule = "%VAR%" };
+        }
+
+        // Block `tee`
+        {
+            var words_iter = std.mem.tokenizeAny(u8, command, " \t\n;|");
+            while (words_iter.next()) |word| {
+                if (std.mem.eql(u8, word, "tee") or std.mem.eql(u8, extractBasename(word), "tee")) {
+                    return .{ .code = .tee_blocked, .matched_rule = "tee" };
+                }
+            }
+        }
+
+        // Block single & background chaining
+        if (containsSingleAmpersand(command)) return .{ .code = .background_chain, .matched_rule = "&" };
+
+        // Block output redirections
+        if (std.mem.indexOfScalar(u8, command, '>') != null) return .{ .code = .redirect, .matched_rule = ">" };
+
+        var normalized: [MAX_ANALYSIS_LEN]u8 = undefined;
+        const norm_len = normalizeCommand(command, &normalized);
+        const norm = normalized[0..norm_len];
+
+        var has_cmd = false;
+        var iter = std.mem.splitScalar(u8, norm, 0);
+        while (iter.next()) |raw_segment| {
+            const segment = std.mem.trim(u8, raw_segment, " \t");
+            if (segment.len == 0) continue;
+
+            const cmd_part = skipEnvAssignments(segment);
+            var words = std.mem.tokenizeScalar(u8, cmd_part, ' ');
+            const first_word = words.next() orelse continue;
+            if (first_word.len == 0) continue;
+
+            const base_cmd = extractBasename(first_word);
+            if (base_cmd.len == 0) continue;
+
+            has_cmd = true;
+
+            var found = false;
+            for (self.allowed_commands) |allowed| {
+                if (std.mem.eql(u8, allowed, base_cmd)) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) return .{ .code = .not_allowed, .matched_rule = base_cmd, .command = command };
+
+            if (!isArgsSafe(base_cmd, cmd_part)) return .{ .code = .unsafe_args, .matched_rule = base_cmd, .command = command };
+        }
+
+        if (!has_cmd) return .{ .code = .not_allowed };
+
+        return null; // allowed
+    }
+
+    /// Structured alternative to `validateCommandExecution`. Returns a
+    /// `PolicyResult` with full deny context instead of a bare error.
+    /// Fires the `deny_hook` callback on denial.
+    pub fn validateCommandDetailed(
+        self: *const SecurityPolicy,
+        command: []const u8,
+        approved: bool,
+    ) PolicyResult {
+        // Allowlist / injection checks
+        if (self.isCommandAllowedDetailed(command)) |deny| {
+            var d = deny;
+            d.command = command;
+            self.fireDenyHook(&d);
+            return .{ .denied = d };
+        }
+
+        const risk = self.commandRiskLevel(command);
+
+        if (risk == .high) {
+            if (self.block_high_risk_commands) {
+                var d = PolicyDeny{ .code = .high_risk_blocked, .risk = .high, .command = command };
+                self.fireDenyHook(&d);
+                return .{ .denied = d };
+            }
+            if (self.autonomy == .supervised and !approved) {
+                var d = PolicyDeny{ .code = .approval_required, .risk = .high, .command = command };
+                self.fireDenyHook(&d);
+                return .{ .denied = d };
+            }
+        }
+
+        if (risk == .medium and
+            self.autonomy == .supervised and
+            self.require_approval_for_medium_risk and
+            !approved)
+        {
+            var d = PolicyDeny{ .code = .approval_required, .risk = .medium, .command = command };
+            self.fireDenyHook(&d);
+            return .{ .denied = d };
+        }
+
+        return .{ .allowed = risk };
+    }
+
+    /// Invoke the deny hook if configured.
+    fn fireDenyHook(self: *const SecurityPolicy, deny: *const PolicyDeny) void {
+        if (self.deny_hook) |hook| {
+            hook(deny);
+        }
     }
 };
 
@@ -1080,4 +1353,289 @@ test "command at MAX_ANALYSIS_LEN minus one is still analyzed" {
     @memset(buf[3..], 'A');
     try std.testing.expect(p.isCommandAllowed(&buf));
     try std.testing.expectEqual(CommandRiskLevel.low, p.commandRiskLevel(&buf));
+}
+
+// ── DenyCode tests ──────────────────────────────────────────────────
+
+test "DenyCode toString roundtrip" {
+    const codes = [_]DenyCode{
+        .read_only,         .oversized,       .injection,
+        .process_substitution, .background_chain, .redirect,
+        .tee_blocked,       .not_allowed,     .unsafe_args,
+        .high_risk_blocked, .approval_required, .rate_limited,
+    };
+    for (codes) |c| {
+        const str = c.toString();
+        try std.testing.expect(str.len > 0);
+        try std.testing.expect(DenyCode.fromString(str).? == c);
+    }
+    try std.testing.expect(DenyCode.fromString("bogus") == null);
+}
+
+test "DenyCode message is non-empty" {
+    const codes = [_]DenyCode{
+        .read_only, .oversized, .injection, .not_allowed,
+        .high_risk_blocked, .approval_required,
+    };
+    for (codes) |c| {
+        try std.testing.expect(c.message().len > 0);
+    }
+}
+
+test "CommandRiskLevel fromString roundtrip" {
+    try std.testing.expect(CommandRiskLevel.fromString("low").? == .low);
+    try std.testing.expect(CommandRiskLevel.fromString("medium").? == .medium);
+    try std.testing.expect(CommandRiskLevel.fromString("high").? == .high);
+    try std.testing.expect(CommandRiskLevel.fromString("bogus") == null);
+}
+
+// ── PolicyDeny tests ────────────────────────────────────────────────
+
+test "PolicyDeny message delegates to code" {
+    const deny = PolicyDeny{ .code = .injection, .matched_rule = "`" };
+    try std.testing.expectEqualStrings(DenyCode.injection.message(), deny.message());
+}
+
+test "PolicyDeny writeJson produces valid output" {
+    const deny = PolicyDeny{
+        .code = .not_allowed,
+        .risk = .low,
+        .matched_rule = "python3",
+    };
+    var buf: [512]u8 = undefined;
+    const json = deny.writeJson(&buf).?;
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"code\":\"not_allowed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"risk\":\"low\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"matched_rule\":\"python3\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"message\":") != null);
+}
+
+test "PolicyDeny writeJson without optional fields" {
+    const deny = PolicyDeny{ .code = .read_only };
+    var buf: [512]u8 = undefined;
+    const json = deny.writeJson(&buf).?;
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"code\":\"read_only\"") != null);
+    // No risk or matched_rule fields
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"risk\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"matched_rule\"") == null);
+}
+
+test "PolicyDeny writeJson returns null on tiny buffer" {
+    const deny = PolicyDeny{ .code = .injection };
+    var buf: [5]u8 = undefined;
+    try std.testing.expect(deny.writeJson(&buf) == null);
+}
+
+// ── PolicyResult tests ──────────────────────────────────────────────
+
+test "PolicyResult allowed" {
+    const r = PolicyResult{ .allowed = .low };
+    try std.testing.expect(r.isAllowed());
+    try std.testing.expect(!r.isDenied());
+}
+
+test "PolicyResult denied" {
+    const r = PolicyResult{ .denied = .{ .code = .injection } };
+    try std.testing.expect(r.isDenied());
+    try std.testing.expect(!r.isAllowed());
+}
+
+// ── isCommandAllowedDetailed tests ──────────────────────────────────
+
+test "detailed: readonly returns read_only code" {
+    const p = SecurityPolicy{ .autonomy = .read_only };
+    const deny = p.isCommandAllowedDetailed("ls").?;
+    try std.testing.expect(deny.code == .read_only);
+}
+
+test "detailed: backtick returns injection code" {
+    const p = SecurityPolicy{};
+    const deny = p.isCommandAllowedDetailed("echo `whoami`").?;
+    try std.testing.expect(deny.code == .injection);
+    try std.testing.expectEqualStrings("`", deny.matched_rule.?);
+}
+
+test "detailed: dollar-paren returns injection code" {
+    const p = SecurityPolicy{};
+    const deny = p.isCommandAllowedDetailed("echo $(cat /etc/passwd)").?;
+    try std.testing.expect(deny.code == .injection);
+    try std.testing.expectEqualStrings("$(", deny.matched_rule.?);
+}
+
+test "detailed: process substitution detected" {
+    const p = SecurityPolicy{};
+    const deny = p.isCommandAllowedDetailed("cat <(echo hello)").?;
+    try std.testing.expect(deny.code == .process_substitution);
+    try std.testing.expectEqualStrings("<(", deny.matched_rule.?);
+}
+
+test "detailed: tee blocked" {
+    const p = SecurityPolicy{};
+    const deny = p.isCommandAllowedDetailed("echo hello | tee /tmp/out").?;
+    try std.testing.expect(deny.code == .tee_blocked);
+}
+
+test "detailed: redirect blocked" {
+    const p = SecurityPolicy{};
+    const deny = p.isCommandAllowedDetailed("echo secret > /etc/crontab").?;
+    try std.testing.expect(deny.code == .redirect);
+}
+
+test "detailed: background chain blocked" {
+    var p = SecurityPolicy{};
+    p.allowed_commands = &.{"ls"};
+    const deny = p.isCommandAllowedDetailed("ls & ls").?;
+    try std.testing.expect(deny.code == .background_chain);
+}
+
+test "detailed: not in allowlist" {
+    const p = SecurityPolicy{};
+    const deny = p.isCommandAllowedDetailed("python3 exploit.py").?;
+    try std.testing.expect(deny.code == .not_allowed);
+}
+
+test "detailed: unsafe args" {
+    const p = SecurityPolicy{};
+    const deny = p.isCommandAllowedDetailed("find . -exec rm {} +").?;
+    try std.testing.expect(deny.code == .unsafe_args);
+}
+
+test "detailed: allowed command returns null" {
+    const p = SecurityPolicy{};
+    try std.testing.expect(p.isCommandAllowedDetailed("ls -la") == null);
+    try std.testing.expect(p.isCommandAllowedDetailed("git status") == null);
+}
+
+// ── validateCommandDetailed tests ───────────────────────────────────
+
+test "validateCommandDetailed: allowed low risk" {
+    const p = SecurityPolicy{};
+    const result = p.validateCommandDetailed("ls -la", false);
+    try std.testing.expect(result.isAllowed());
+    try std.testing.expect(result.allowed == .low);
+}
+
+test "validateCommandDetailed: denied not allowed" {
+    const p = SecurityPolicy{};
+    const result = p.validateCommandDetailed("python3 exploit.py", false);
+    try std.testing.expect(result.isDenied());
+    try std.testing.expect(result.denied.code == .not_allowed);
+}
+
+test "validateCommandDetailed: denied high risk blocked" {
+    const allowed = [_][]const u8{"rm"};
+    const p = SecurityPolicy{
+        .autonomy = .supervised,
+        .allowed_commands = &allowed,
+    };
+    const result = p.validateCommandDetailed("rm -rf /tmp/test", true);
+    try std.testing.expect(result.isDenied());
+    try std.testing.expect(result.denied.code == .high_risk_blocked);
+    try std.testing.expect(result.denied.risk.? == .high);
+}
+
+test "validateCommandDetailed: denied approval required medium" {
+    const allowed = [_][]const u8{"touch"};
+    const p = SecurityPolicy{
+        .autonomy = .supervised,
+        .require_approval_for_medium_risk = true,
+        .allowed_commands = &allowed,
+    };
+    const result = p.validateCommandDetailed("touch test.txt", false);
+    try std.testing.expect(result.isDenied());
+    try std.testing.expect(result.denied.code == .approval_required);
+    try std.testing.expect(result.denied.risk.? == .medium);
+}
+
+test "validateCommandDetailed: approved medium passes" {
+    const allowed = [_][]const u8{"touch"};
+    const p = SecurityPolicy{
+        .autonomy = .supervised,
+        .require_approval_for_medium_risk = true,
+        .allowed_commands = &allowed,
+    };
+    const result = p.validateCommandDetailed("touch test.txt", true);
+    try std.testing.expect(result.isAllowed());
+    try std.testing.expect(result.allowed == .medium);
+}
+
+test "validateCommandDetailed: injection gives structured deny" {
+    const p = SecurityPolicy{};
+    const result = p.validateCommandDetailed("echo `whoami`", false);
+    try std.testing.expect(result.isDenied());
+    try std.testing.expect(result.denied.code == .injection);
+    try std.testing.expectEqualStrings("`", result.denied.matched_rule.?);
+}
+
+// ── deny_hook tests ─────────────────────────────────────────────────
+
+var test_hook_called: bool = false;
+var test_hook_last_code: DenyCode = .read_only;
+
+fn testDenyHook(deny: *const PolicyDeny) void {
+    test_hook_called = true;
+    test_hook_last_code = deny.code;
+}
+
+test "deny_hook fires on validateCommandDetailed denial" {
+    test_hook_called = false;
+    const p = SecurityPolicy{ .deny_hook = testDenyHook };
+    const result = p.validateCommandDetailed("python3 exploit.py", false);
+    try std.testing.expect(result.isDenied());
+    try std.testing.expect(test_hook_called);
+    try std.testing.expect(test_hook_last_code == .not_allowed);
+}
+
+test "deny_hook does not fire on allowed commands" {
+    test_hook_called = false;
+    const p = SecurityPolicy{ .deny_hook = testDenyHook };
+    const result = p.validateCommandDetailed("ls -la", false);
+    try std.testing.expect(result.isAllowed());
+    try std.testing.expect(!test_hook_called);
+}
+
+test "deny_hook null is safe" {
+    const p = SecurityPolicy{ .deny_hook = null };
+    const result = p.validateCommandDetailed("python3 bad.py", false);
+    try std.testing.expect(result.isDenied());
+    // no crash
+}
+
+test "deny_hook fires on injection denial" {
+    test_hook_called = false;
+    const p = SecurityPolicy{ .deny_hook = testDenyHook };
+    _ = p.validateCommandDetailed("echo $(whoami)", false);
+    try std.testing.expect(test_hook_called);
+    try std.testing.expect(test_hook_last_code == .injection);
+}
+
+test "deny_hook fires on high risk blocked" {
+    test_hook_called = false;
+    const allowed = [_][]const u8{"rm"};
+    const p = SecurityPolicy{
+        .deny_hook = testDenyHook,
+        .allowed_commands = &allowed,
+    };
+    _ = p.validateCommandDetailed("rm -rf /tmp", false);
+    try std.testing.expect(test_hook_called);
+    try std.testing.expect(test_hook_last_code == .high_risk_blocked);
+}
+
+// ── Consistency: detailed matches original ──────────────────────────
+
+test "validateCommandDetailed consistent with validateCommandExecution" {
+    const p = SecurityPolicy{};
+
+    // Allowed: ls
+    const old_ok = p.validateCommandExecution("ls -la", false);
+    const new_ok = p.validateCommandDetailed("ls -la", false);
+    try std.testing.expect(old_ok != error.CommandNotAllowed and
+        old_ok != error.HighRiskBlocked and old_ok != error.ApprovalRequired);
+    try std.testing.expect(new_ok.isAllowed());
+
+    // Denied: python3
+    const old_deny = p.validateCommandExecution("python3 exploit.py", false);
+    const new_deny = p.validateCommandDetailed("python3 exploit.py", false);
+    try std.testing.expectError(error.CommandNotAllowed, old_deny);
+    try std.testing.expect(new_deny.isDenied());
 }
