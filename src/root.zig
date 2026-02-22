@@ -51,6 +51,7 @@ pub const runtime = @import("runtime.zig");
 pub const events = @import("events.zig");
 pub const events_store = @import("events_store.zig");
 pub const replay = @import("replay.zig");
+pub const edge = @import("edge.zig");
 
 // Phase 4b: MCP (Model Context Protocol)
 pub const mcp = @import("mcp.zig");
