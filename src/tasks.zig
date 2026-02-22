@@ -122,6 +122,8 @@ pub const StepRecord = struct {
     started_at: ?[]const u8 = null,
     /// ISO-8601 timestamp when this step finished.
     finished_at: ?[]const u8 = null,
+    /// Optional per-step retry policy override.
+    retry_policy: StepRetryPolicy = StepRetryPolicy.inherit,
 };
 
 // ── Retry policy ───────────────────────────────────────────────────
@@ -149,6 +151,129 @@ pub const RetryPolicy = struct {
     }
 };
 
+// ── Step-level retry policy ────────────────────────────────────────
+// Per-step retry config that can override the task-level policy.
+
+pub const StepRetryPolicy = struct {
+    /// Maximum retries for this specific step (null = inherit task policy).
+    max_retries: ?u32 = null,
+    /// Base backoff in nanoseconds (null = inherit task policy).
+    backoff_base_ns: ?u64 = null,
+    /// Max backoff cap in nanoseconds (null = inherit task policy).
+    backoff_max_ns: ?u64 = null,
+
+    pub const inherit: StepRetryPolicy = .{};
+
+    /// Resolve this step policy against a parent task-level RetryPolicy.
+    /// Fields set to null fall through to the parent.
+    pub fn resolve(self: StepRetryPolicy, parent: RetryPolicy) RetryPolicy {
+        return .{
+            .max_retries = self.max_retries orelse parent.max_retries,
+            .backoff_base_ns = self.backoff_base_ns orelse parent.backoff_base_ns,
+            .backoff_max_ns = self.backoff_max_ns orelse parent.backoff_max_ns,
+        };
+    }
+};
+
+// ── Verifier hook ──────────────────────────────────────────────────
+// A config-gated hook point invoked after each step completes.
+
+pub const VerifyResult = enum {
+    /// Step output accepted — proceed to next step.
+    accept,
+    /// Step output rejected — retry if policy allows.
+    reject,
+    /// Step output rejected — skip to next step.
+    skip,
+    /// Step output rejected — abort the entire task.
+    abort,
+
+    pub fn isRetryable(self: VerifyResult) bool {
+        return self == .reject;
+    }
+};
+
+/// Signature for a verifier hook callback.
+/// Receives the completed step record and the task id.
+/// Returns a VerifyResult controlling what happens next.
+pub const VerifierHookFn = *const fn (task_id: []const u8, step: *const StepRecord) VerifyResult;
+
+pub const VerifierConfig = struct {
+    /// Whether the verifier hook is active.
+    enabled: bool = false,
+    /// Optional hook function. When null (even if enabled), verification is skipped.
+    hook: ?VerifierHookFn = null,
+
+    pub const disabled: VerifierConfig = .{};
+
+    /// Run the verifier if enabled and a hook is set. Returns .accept when disabled.
+    pub fn verify(self: VerifierConfig, task_id: []const u8, step: *const StepRecord) VerifyResult {
+        if (!self.enabled) return .accept;
+        const hook = self.hook orelse return .accept;
+        return hook(task_id, step);
+    }
+};
+
+// ── Step retry helpers ─────────────────────────────────────────────
+
+/// Determine whether a step should be retried given its current state
+/// and the effective retry policy.
+pub fn shouldRetryStep(step: *const StepRecord, policy: RetryPolicy) bool {
+    if (step.status != .failed) return false;
+    return step.retries < policy.max_retries;
+}
+
+/// Record a retry attempt on a step: increment counter, reset to .running.
+/// Returns the backoff delay in nanoseconds the caller should wait.
+pub fn recordStepRetry(step: *StepRecord, policy: RetryPolicy) u64 {
+    const delay = policy.backoffFor(step.retries);
+    step.retries += 1;
+    step.status = .running;
+    step.last_error = null;
+    return delay;
+}
+
+/// Mark a step as failed with an error message.
+pub fn failStep(step: *StepRecord, err_msg: ?[]const u8) void {
+    step.status = .failed;
+    step.last_error = err_msg;
+}
+
+/// Mark a step as completed successfully.
+pub fn completeStep(step: *StepRecord) void {
+    step.status = .completed;
+    step.last_error = null;
+}
+
+/// Apply a VerifyResult to a step and task, returning whether the task
+/// should continue advancing. When reject + retries remain, the step
+/// is reset for retry. When reject + no retries, the step stays failed.
+pub fn applyVerifyResult(
+    step: *StepRecord,
+    result: VerifyResult,
+    policy: RetryPolicy,
+) enum { continue_task, retry_step, step_failed, task_aborted } {
+    return switch (result) {
+        .accept => .continue_task,
+        .skip => {
+            step.status = .skipped;
+            return .continue_task;
+        },
+        .reject => {
+            failStep(step, "rejected by verifier");
+            if (shouldRetryStep(step, policy)) {
+                _ = recordStepRetry(step, policy);
+                return .retry_step;
+            }
+            return .step_failed;
+        },
+        .abort => {
+            failStep(step, "aborted by verifier");
+            return .task_aborted;
+        },
+    };
+}
+
 // ── Task record ────────────────────────────────────────────────────
 // The main persistent record for a long-running task.
 
@@ -167,6 +292,8 @@ pub const TaskRecord = struct {
     retry_policy: RetryPolicy = .{},
     /// Individual steps (slice; empty for single-step tasks).
     steps: []const StepRecord = &.{},
+    /// Verifier configuration for this task (disabled by default).
+    verifier: VerifierConfig = VerifierConfig.disabled,
     /// Index of the current step being executed (0-based).
     current_step: u32 = 0,
     /// Optional description or context.
@@ -346,4 +473,303 @@ test "TaskRecord progress with steps" {
     };
     // 2 out of 4 steps are done (completed + skipped)
     try std.testing.expectEqual(@as(f64, 0.5), task.progress());
+}
+
+// ── StepRetryPolicy tests ──────────────────────────────────────────
+
+test "StepRetryPolicy.inherit defaults all to null" {
+    const sp = StepRetryPolicy.inherit;
+    try std.testing.expect(sp.max_retries == null);
+    try std.testing.expect(sp.backoff_base_ns == null);
+    try std.testing.expect(sp.backoff_max_ns == null);
+}
+
+test "StepRetryPolicy.resolve inherits from parent when null" {
+    const parent = RetryPolicy{
+        .max_retries = 5,
+        .backoff_base_ns = 2000,
+        .backoff_max_ns = 60000,
+    };
+    const sp = StepRetryPolicy.inherit;
+    const resolved = sp.resolve(parent);
+    try std.testing.expectEqual(@as(u32, 5), resolved.max_retries);
+    try std.testing.expectEqual(@as(u64, 2000), resolved.backoff_base_ns);
+    try std.testing.expectEqual(@as(u64, 60000), resolved.backoff_max_ns);
+}
+
+test "StepRetryPolicy.resolve overrides parent when set" {
+    const parent = RetryPolicy{
+        .max_retries = 5,
+        .backoff_base_ns = 2000,
+        .backoff_max_ns = 60000,
+    };
+    const sp = StepRetryPolicy{
+        .max_retries = 1,
+        .backoff_base_ns = null, // inherit
+        .backoff_max_ns = 10000,
+    };
+    const resolved = sp.resolve(parent);
+    try std.testing.expectEqual(@as(u32, 1), resolved.max_retries);
+    try std.testing.expectEqual(@as(u64, 2000), resolved.backoff_base_ns); // inherited
+    try std.testing.expectEqual(@as(u64, 10000), resolved.backoff_max_ns); // overridden
+}
+
+test "StepRetryPolicy.resolve full override" {
+    const parent = RetryPolicy{};
+    const sp = StepRetryPolicy{
+        .max_retries = 10,
+        .backoff_base_ns = 500,
+        .backoff_max_ns = 5000,
+    };
+    const resolved = sp.resolve(parent);
+    try std.testing.expectEqual(@as(u32, 10), resolved.max_retries);
+    try std.testing.expectEqual(@as(u64, 500), resolved.backoff_base_ns);
+    try std.testing.expectEqual(@as(u64, 5000), resolved.backoff_max_ns);
+}
+
+// ── VerifyResult tests ─────────────────────────────────────────────
+
+test "VerifyResult.isRetryable" {
+    try std.testing.expect(VerifyResult.reject.isRetryable());
+    try std.testing.expect(!VerifyResult.accept.isRetryable());
+    try std.testing.expect(!VerifyResult.skip.isRetryable());
+    try std.testing.expect(!VerifyResult.abort.isRetryable());
+}
+
+// ── VerifierConfig tests ───────────────────────────────────────────
+
+test "VerifierConfig.disabled returns accept" {
+    const vc = VerifierConfig.disabled;
+    try std.testing.expect(!vc.enabled);
+    try std.testing.expect(vc.hook == null);
+    const step = StepRecord{ .name = "s1", .status = .completed };
+    try std.testing.expect(vc.verify("task-1", &step) == .accept);
+}
+
+test "VerifierConfig enabled but no hook returns accept" {
+    const vc = VerifierConfig{ .enabled = true, .hook = null };
+    const step = StepRecord{ .name = "s1", .status = .completed };
+    try std.testing.expect(vc.verify("task-1", &step) == .accept);
+}
+
+fn testRejectHook(_: []const u8, _: *const StepRecord) VerifyResult {
+    return .reject;
+}
+
+fn testAcceptHook(_: []const u8, _: *const StepRecord) VerifyResult {
+    return .accept;
+}
+
+fn testAbortHook(_: []const u8, _: *const StepRecord) VerifyResult {
+    return .abort;
+}
+
+fn testSkipHook(_: []const u8, _: *const StepRecord) VerifyResult {
+    return .skip;
+}
+
+test "VerifierConfig enabled with hook invokes it" {
+    const vc = VerifierConfig{ .enabled = true, .hook = testRejectHook };
+    const step = StepRecord{ .name = "s1", .status = .completed };
+    try std.testing.expect(vc.verify("task-1", &step) == .reject);
+}
+
+test "VerifierConfig disabled with hook still returns accept" {
+    const vc = VerifierConfig{ .enabled = false, .hook = testRejectHook };
+    const step = StepRecord{ .name = "s1", .status = .completed };
+    try std.testing.expect(vc.verify("task-1", &step) == .accept);
+}
+
+test "VerifierConfig verify with accept hook" {
+    const vc = VerifierConfig{ .enabled = true, .hook = testAcceptHook };
+    const step = StepRecord{ .name = "s1", .status = .completed };
+    try std.testing.expect(vc.verify("task-1", &step) == .accept);
+}
+
+// ── Step retry helper tests ────────────────────────────────────────
+
+test "shouldRetryStep returns false for non-failed step" {
+    const step = StepRecord{ .name = "s1", .status = .running };
+    const policy = RetryPolicy{ .max_retries = 3 };
+    try std.testing.expect(!shouldRetryStep(&step, policy));
+}
+
+test "shouldRetryStep returns true when retries remain" {
+    const step = StepRecord{ .name = "s1", .status = .failed, .retries = 1 };
+    const policy = RetryPolicy{ .max_retries = 3 };
+    try std.testing.expect(shouldRetryStep(&step, policy));
+}
+
+test "shouldRetryStep returns false when retries exhausted" {
+    const step = StepRecord{ .name = "s1", .status = .failed, .retries = 3 };
+    const policy = RetryPolicy{ .max_retries = 3 };
+    try std.testing.expect(!shouldRetryStep(&step, policy));
+}
+
+test "shouldRetryStep with zero-retry policy" {
+    const step = StepRecord{ .name = "s1", .status = .failed, .retries = 0 };
+    try std.testing.expect(!shouldRetryStep(&step, RetryPolicy.none));
+}
+
+test "recordStepRetry increments counter and sets running" {
+    var step = StepRecord{ .name = "s1", .status = .failed, .retries = 0, .last_error = "oops" };
+    const policy = RetryPolicy{ .backoff_base_ns = 1000, .backoff_max_ns = 10000 };
+    const delay = recordStepRetry(&step, policy);
+    try std.testing.expectEqual(@as(u32, 1), step.retries);
+    try std.testing.expect(step.status == .running);
+    try std.testing.expect(step.last_error == null);
+    try std.testing.expectEqual(@as(u64, 1000), delay);
+}
+
+test "recordStepRetry exponential backoff" {
+    var step = StepRecord{ .name = "s1", .status = .failed, .retries = 2 };
+    const policy = RetryPolicy{ .backoff_base_ns = 100, .backoff_max_ns = 1000 };
+    const delay = recordStepRetry(&step, policy);
+    // attempt=2 -> 100 * 2^2 = 400
+    try std.testing.expectEqual(@as(u64, 400), delay);
+    try std.testing.expectEqual(@as(u32, 3), step.retries);
+}
+
+test "failStep sets status and error" {
+    var step = StepRecord{ .name = "s1", .status = .running };
+    failStep(&step, "connection timeout");
+    try std.testing.expect(step.status == .failed);
+    try std.testing.expectEqualStrings("connection timeout", step.last_error.?);
+}
+
+test "failStep with null error" {
+    var step = StepRecord{ .name = "s1", .status = .running };
+    failStep(&step, null);
+    try std.testing.expect(step.status == .failed);
+    try std.testing.expect(step.last_error == null);
+}
+
+test "completeStep sets status and clears error" {
+    var step = StepRecord{ .name = "s1", .status = .running, .last_error = "old error" };
+    completeStep(&step);
+    try std.testing.expect(step.status == .completed);
+    try std.testing.expect(step.last_error == null);
+}
+
+// ── applyVerifyResult tests ────────────────────────────────────────
+
+test "applyVerifyResult accept continues task" {
+    var step = StepRecord{ .name = "s1", .status = .completed };
+    const policy = RetryPolicy{ .max_retries = 3 };
+    const outcome = applyVerifyResult(&step, .accept, policy);
+    try std.testing.expect(outcome == .continue_task);
+}
+
+test "applyVerifyResult skip marks step skipped" {
+    var step = StepRecord{ .name = "s1", .status = .completed };
+    const policy = RetryPolicy{ .max_retries = 3 };
+    const outcome = applyVerifyResult(&step, .skip, policy);
+    try std.testing.expect(outcome == .continue_task);
+    try std.testing.expect(step.status == .skipped);
+}
+
+test "applyVerifyResult reject with retries remaining" {
+    var step = StepRecord{ .name = "s1", .status = .completed, .retries = 0 };
+    const policy = RetryPolicy{ .max_retries = 2, .backoff_base_ns = 100 };
+    const outcome = applyVerifyResult(&step, .reject, policy);
+    try std.testing.expect(outcome == .retry_step);
+    try std.testing.expect(step.status == .running);
+    try std.testing.expectEqual(@as(u32, 1), step.retries);
+}
+
+test "applyVerifyResult reject with retries exhausted" {
+    var step = StepRecord{ .name = "s1", .status = .completed, .retries = 3 };
+    const policy = RetryPolicy{ .max_retries = 3 };
+    const outcome = applyVerifyResult(&step, .reject, policy);
+    try std.testing.expect(outcome == .step_failed);
+    try std.testing.expect(step.status == .failed);
+}
+
+test "applyVerifyResult abort fails step and aborts task" {
+    var step = StepRecord{ .name = "s1", .status = .completed };
+    const policy = RetryPolicy{ .max_retries = 10 };
+    const outcome = applyVerifyResult(&step, .abort, policy);
+    try std.testing.expect(outcome == .task_aborted);
+    try std.testing.expect(step.status == .failed);
+    try std.testing.expectEqualStrings("aborted by verifier", step.last_error.?);
+}
+
+// ── StepRecord retry_policy field test ─────────────────────────────
+
+test "StepRecord default retry_policy is inherit" {
+    const step = StepRecord{ .name = "s1" };
+    try std.testing.expect(step.retry_policy.max_retries == null);
+    try std.testing.expect(step.retry_policy.backoff_base_ns == null);
+    try std.testing.expect(step.retry_policy.backoff_max_ns == null);
+}
+
+test "StepRecord with custom retry_policy" {
+    const step = StepRecord{
+        .name = "s1",
+        .retry_policy = .{ .max_retries = 5 },
+    };
+    try std.testing.expectEqual(@as(?u32, 5), step.retry_policy.max_retries);
+}
+
+// ── TaskRecord verifier field test ─────────────────────────────────
+
+test "TaskRecord default verifier is disabled" {
+    const task = TaskRecord{
+        .id = "t1",
+        .name = "test-task",
+        .created_at = "2026-01-01T00:00:00Z",
+        .updated_at = "2026-01-01T00:00:00Z",
+    };
+    try std.testing.expect(!task.verifier.enabled);
+    try std.testing.expect(task.verifier.hook == null);
+}
+
+test "TaskRecord with verifier enabled" {
+    const task = TaskRecord{
+        .id = "t1",
+        .name = "verified-task",
+        .verifier = .{ .enabled = true, .hook = testAcceptHook },
+        .created_at = "2026-01-01T00:00:00Z",
+        .updated_at = "2026-01-01T00:00:00Z",
+    };
+    try std.testing.expect(task.verifier.enabled);
+    const step = StepRecord{ .name = "s1", .status = .completed };
+    try std.testing.expect(task.verifier.verify(task.id, &step) == .accept);
+}
+
+// ── Integration: step retry + verifier ─────────────────────────────
+
+test "full step retry cycle with verifier reject then accept" {
+    // Simulate a step that gets rejected, retried, then accepted
+    var step = StepRecord{ .name = "build", .status = .completed, .retries = 0 };
+    const policy = RetryPolicy{ .max_retries = 2, .backoff_base_ns = 100, .backoff_max_ns = 1000 };
+
+    // First verify: reject -> retry
+    const r1 = applyVerifyResult(&step, .reject, policy);
+    try std.testing.expect(r1 == .retry_step);
+    try std.testing.expect(step.status == .running);
+    try std.testing.expectEqual(@as(u32, 1), step.retries);
+
+    // Step re-completes
+    completeStep(&step);
+    try std.testing.expect(step.status == .completed);
+
+    // Second verify: accept
+    const r2 = applyVerifyResult(&step, .accept, policy);
+    try std.testing.expect(r2 == .continue_task);
+}
+
+test "step retry resolves per-step policy before checking" {
+    const task_policy = RetryPolicy{ .max_retries = 1, .backoff_base_ns = 100, .backoff_max_ns = 1000 };
+    var step = StepRecord{
+        .name = "deploy",
+        .status = .failed,
+        .retries = 1,
+        .retry_policy = .{ .max_retries = 5 }, // override: allow more retries
+    };
+    // With task policy (max 1), no retry
+    try std.testing.expect(!shouldRetryStep(&step, task_policy));
+    // With resolved step policy (max 5), retry allowed
+    const resolved = step.retry_policy.resolve(task_policy);
+    try std.testing.expect(shouldRetryStep(&step, resolved));
 }
