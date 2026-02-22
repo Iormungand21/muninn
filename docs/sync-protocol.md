@@ -102,9 +102,97 @@ All payloads use JSONL (one JSON object per line) for wire transport and
 persistent queue storage.  Serialization uses stack-allocated fixed buffers
 (no heap allocation) via `serializeEnvelope()` and `serializeAck()`.
 
+## Handshake Flow
+
+Federation connections begin with a three-phase handshake:
+
+```
+Initiator (muninn)              Responder (huginn)
+      |                                |
+      |--- HandshakeInit ------------->|   (idle -> init_sent)
+      |                                |   (idle -> init_received)
+      |<-- HandshakeResponse (accept) -|   (init_received -> ack_sent)
+      |    (init_sent -> established)  |
+      |--- first heartbeat/sync ------>|   (ack_sent -> established)
+      |                                |
+```
+
+### HandshakeInit
+
+| Field                | Type   | Default  | Notes                          |
+|----------------------|--------|----------|--------------------------------|
+| handshake_id         | string | required | Unique session ID              |
+| node_id              | string | required | Initiator node ID              |
+| node_role            | enum   | muninn   | muninn / huginn / unknown      |
+| schema_version       | string | 1.0      | Offered protocol version       |
+| intent               | enum   | sync     | sync / delegate / observe      |
+| health               | enum   | healthy  | Current health of initiator    |
+| timestamp            | string | required | ISO-8601 creation time         |
+| heartbeat_interval_s | u32    | 30       | Proposed heartbeat interval    |
+
+### HandshakeResponse
+
+| Field                | Type   | Default  | Notes                          |
+|----------------------|--------|----------|--------------------------------|
+| handshake_id         | string | required | Echoed from init               |
+| node_id              | string | required | Responder node ID              |
+| node_role            | enum   | huginn   | muninn / huginn / unknown      |
+| accepted             | bool   | required | Whether handshake is accepted  |
+| schema_version       | string | 1.0      | Responder's protocol version   |
+| health               | enum   | healthy  | Responder's current health     |
+| timestamp            | string | required | ISO-8601 response time         |
+| heartbeat_interval_s | u32    | 30       | Agreed heartbeat interval      |
+| reject_reason        | string | null     | Reason if not accepted         |
+
+### Handshake State Machine
+
+States: `idle` → `init_sent` / `init_received` → `ack_sent` → `established`
+
+Terminal states: `established`, `rejected`, `failed`
+
+Retry: `failed` → `init_sent` (re-initiate from failed state).
+
+## Heartbeat Flow
+
+After a connection is established, peers exchange periodic heartbeats to
+detect liveness and report health status.
+
+### Heartbeat
+
+| Field               | Type   | Default  | Notes                           |
+|---------------------|--------|----------|---------------------------------|
+| node_id             | string | required | Sender node ID                  |
+| health              | enum   | healthy  | healthy / degraded / offline    |
+| sequence            | u64    | required | Monotonic per-connection counter|
+| timestamp           | string | required | ISO-8601 heartbeat time         |
+| last_sync_sequence  | u64    | 0        | Last applied sync sequence      |
+| pending_sync_count  | u32    | 0        | Queued outbound sync items      |
+
+### HeartbeatAck
+
+| Field               | Type   | Default  | Notes                           |
+|---------------------|--------|----------|---------------------------------|
+| node_id             | string | required | Acknowledger node ID            |
+| health              | enum   | healthy  | Acknowledger's current health   |
+| sequence            | u64    | required | Heartbeat sequence being ack'd  |
+| timestamp           | string | required | ISO-8601 ack time               |
+| last_sync_sequence  | u64    | 0        | Acknowledger's last sync seq    |
+
+### Health Degradation
+
+Consecutive heartbeat misses trigger health transitions:
+
+| Misses | Peer health | Sync allowed? |
+|--------|-------------|---------------|
+| 0      | healthy     | yes           |
+| 1–2    | degraded    | yes           |
+| 3+     | offline     | no            |
+
+A successful heartbeat resets the miss counter and restores reported health.
+
 ## Future Work
 
 - **X2-SYNC-001**: Conflict resolution policy (last-writer-wins, merge, manual)
-- **X3-SYNC-001**: Federated task routing handshake and heartbeat flow
 - Batch envelope support (multiple deltas per message)
 - Compression for large memory content payloads
+- Transport wiring for handshake/heartbeat (WebSocket, HTTP long-poll)
