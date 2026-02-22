@@ -41,6 +41,7 @@ pub const security = @import("security/root.zig");
 pub const cron = @import("cron.zig");
 pub const health = @import("health.zig");
 pub const skills = @import("skills.zig");
+pub const tasks = @import("tasks.zig");
 pub const tools = @import("tools/root.zig");
 pub const identity = @import("identity.zig");
 pub const cost = @import("cost.zig");
