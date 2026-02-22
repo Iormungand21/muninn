@@ -472,6 +472,19 @@ pub const McpServerConfig = struct {
     };
 };
 
+// ── Delegation config ───────────────────────────────────────────
+
+pub const DelegationConfig = struct {
+    /// Whether remote planning delegation is active.
+    enabled: bool = false,
+    /// Base URL of the huginn planning endpoint.
+    endpoint: []const u8 = "http://localhost:8080/plan",
+    /// Request timeout in seconds.
+    timeout_secs: u64 = 30,
+    /// Optional API key for authentication.
+    api_key: ?[]const u8 = null,
+};
+
 // ── Offline queue config ────────────────────────────────────────
 
 pub const OfflineQueueConfig = struct {
