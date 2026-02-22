@@ -501,6 +501,23 @@ pub const OfflineQueueConfig = struct {
     drain_interval_secs: u64 = 60,
 };
 
+// ── Sync config ─────────────────────────────────────────────────
+
+pub const SyncConfig = struct {
+    /// Whether sync is active.
+    enabled: bool = false,
+    /// This node's unique identifier in the sync cluster.
+    node_id: []const u8 = "muninn-default",
+    /// Peer endpoint URL (e.g. huginn sync receiver).
+    peer_endpoint: []const u8 = "http://localhost:8080/sync",
+    /// Sync push interval in seconds.
+    sync_interval_secs: u64 = 30,
+    /// Request timeout in seconds.
+    timeout_secs: u64 = 15,
+    /// Optional API key for authentication.
+    api_key: ?[]const u8 = null,
+};
+
 // ── Model Pricing ──────────────────────────────────────────────
 
 pub const ModelPricing = struct {

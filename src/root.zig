@@ -54,6 +54,7 @@ pub const replay = @import("replay.zig");
 pub const edge = @import("edge.zig");
 pub const offline = @import("offline.zig");
 pub const delegation = @import("delegation.zig");
+pub const sync = @import("sync/root.zig");
 
 // Phase 4b: MCP (Model Context Protocol)
 pub const mcp = @import("mcp.zig");
