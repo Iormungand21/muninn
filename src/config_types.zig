@@ -472,6 +472,22 @@ pub const McpServerConfig = struct {
     };
 };
 
+// ── Offline queue config ────────────────────────────────────────
+
+pub const OfflineQueueConfig = struct {
+    /// Whether the offline queue is active.
+    enabled: bool = false,
+    /// Path to the JSONL queue file.
+    path: []const u8 = "offline_queue.jsonl",
+    /// Maximum items the queue may hold (0 = unlimited).
+    max_items: u32 = 256,
+    /// Maximum delivery attempts per item before marking failed.
+    max_attempts: u32 = 5,
+    /// Drain interval in seconds (how often to attempt delivery of pending items).
+    /// TODO(M3-OFF): Used by the drain loop once network transport is implemented.
+    drain_interval_secs: u64 = 60,
+};
+
 // ── Model Pricing ──────────────────────────────────────────────
 
 pub const ModelPricing = struct {
