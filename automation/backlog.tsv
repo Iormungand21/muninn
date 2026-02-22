@@ -1,0 +1,18 @@
+# Copy this file into the muninn repo as automation/backlog.tsv and adjust task_file paths if needed.
+# status	id	lane	stage	title	task_file	notes
+pending	S1-MEM-001	shared	S1	Typed memory schema and metadata scaffold	automation/tasks/S1-MEM-001.md	-
+pending	S1-TOOL-001	shared	S1	Tool reliability wrapper skeleton with retries/timeouts	automation/tasks/S1-TOOL-001.md	-
+pending	S1-AGENT-001	shared	S1	Persistent task state machine scaffold	automation/tasks/S1-AGENT-001.md	-
+pending	S1-OBS-001	shared	S1	Structured event timeline primitives and file sink	automation/tasks/S1-OBS-001.md	-
+pending	S1-SEC-001	shared	S1	Explainable policy deny reasons and audit event hook	automation/tasks/S1-SEC-001.md	-
+pending	S2-MEM-001	shared	S2	Episodic vs semantic split plus confidence decay primitives	automation/tasks/S2-MEM-001.md	-
+pending	S2-TOOL-001	shared	S2	Tool cache and circuit breaker framework	automation/tasks/S2-TOOL-001.md	-
+pending	S2-AGENT-001	shared	S2	Verifier hook and step-level retry policy	automation/tasks/S2-AGENT-001.md	-
+pending	S2-OBS-001	shared	S2	Replay mode skeleton and budget metrics summary	automation/tasks/S2-OBS-001.md	-
+pending	S2-SEC-001	shared	S2	Secret scoping and per-workspace approval policy config	automation/tasks/S2-SEC-001.md	-
+pending	M1-EDGE-001	muninn	M1	Compact event log and bounded task queue defaults	automation/tasks/M1-EDGE-001.md	-
+pending	M2-OFF-001	muninn	M2	Offline queue and deferred sync-out skeleton	automation/tasks/M2-OFF-001.md	-
+pending	M3-DEL-001	muninn	M3	Remote planning delegation client stub to huginn	automation/tasks/M3-DEL-001.md	-
+pending	X1-SYNC-001	sync	X1	Shared sync protocol types and schema versioning	automation/tasks/X1-SYNC-001.md	-
+pending	X2-SYNC-001	sync	X2	Conflict resolution policy implementation skeleton	automation/tasks/X2-SYNC-001.md	-
+pending	X3-SYNC-001	sync	X3	Federated task routing handshake and heartbeat message flow	automation/tasks/X3-SYNC-001.md	-
