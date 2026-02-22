@@ -337,36 +337,26 @@ fn runChannel(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
     if (std.mem.eql(u8, subcmd, "list")) {
         std.debug.print("Configured channels:\n", .{});
         std.debug.print("  CLI:       {s}\n", .{if (cfg.channels.cli) "enabled" else "disabled"});
-        std.debug.print("  Telegram:  {s}\n", .{if (cfg.channels.telegram != null) "configured" else "not configured"});
         std.debug.print("  Discord:   {s}\n", .{if (cfg.channels.discord != null) "configured" else "not configured"});
         std.debug.print("  Slack:     {s}\n", .{if (cfg.channels.slack != null) "configured" else "not configured"});
         std.debug.print("  Webhook:   {s}\n", .{if (cfg.channels.webhook != null) "configured" else "not configured"});
-        std.debug.print("  iMessage:  {s}\n", .{if (cfg.channels.imessage != null) "configured" else "not configured"});
-        std.debug.print("  Matrix:    {s}\n", .{if (cfg.channels.matrix != null) "configured" else "not configured"});
-        std.debug.print("  WhatsApp:  {s}\n", .{if (cfg.channels.whatsapp != null) "configured" else "not configured"});
-        std.debug.print("  IRC:       {s}\n", .{if (cfg.channels.irc != null) "configured" else "not configured"});
-        std.debug.print("  Lark:      {s}\n", .{if (cfg.channels.lark != null) "configured" else "not configured"});
-        std.debug.print("  DingTalk:  {s}\n", .{if (cfg.channels.dingtalk != null) "configured" else "not configured"});
     } else if (std.mem.eql(u8, subcmd, "start")) {
-        if (cfg.channels.telegram != null) {
-            try runChannelStart(allocator, sub_args[1..]);
-        } else if (cfg.channels.discord != null) {
+        if (cfg.channels.discord != null) {
             try runDiscordChannelStart(allocator, sub_args[1..]);
         } else {
-            std.debug.print("No channel configured. Add telegram or discord to your config.json:\n", .{});
+            std.debug.print("No channel configured. Add discord to your config.json:\n", .{});
             std.debug.print("  \"channels\": {{\"discord\": {{\"accounts\": {{\"main\": {{\"token\": \"...\"}}}}}}}}\n", .{});
             std.process.exit(1);
         }
     } else if (std.mem.eql(u8, subcmd, "doctor")) {
         std.debug.print("Channel health:\n", .{});
         std.debug.print("  CLI:      ok\n", .{});
-        if (cfg.channels.telegram != null) std.debug.print("  Telegram: configured (use `channel start` to verify)\n", .{});
         if (cfg.channels.discord != null) std.debug.print("  Discord:  configured (use `channel start` to verify)\n", .{});
         if (cfg.channels.slack != null) std.debug.print("  Slack:    configured (use `channel start` to verify)\n", .{});
     } else if (std.mem.eql(u8, subcmd, "add")) {
         if (sub_args.len < 2) {
             std.debug.print("Usage: nullclaw channel add <type>\n", .{});
-            std.debug.print("Types: telegram, discord, slack, webhook, matrix, whatsapp, irc, lark, dingtalk\n", .{});
+            std.debug.print("Types: discord, slack, webhook\n", .{});
             std.process.exit(1);
         }
         std.debug.print("To add a '{s}' channel, edit your config file:\n  {s}\n", .{ sub_args[1], cfg.config_path });
@@ -683,237 +673,6 @@ fn runOnboard(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
         try yc.onboard.runWizard(allocator);
     } else {
         try yc.onboard.runQuickSetup(allocator, api_key, provider, memory_backend);
-    }
-}
-
-// ── Channel Start (Telegram bot loop) ────────────────────────────
-
-fn runChannelStart(allocator: std.mem.Allocator, args: []const []const u8) !void {
-    // Load config
-    var config = yc.config.Config.load(allocator) catch {
-        std.debug.print("No config found -- run `nullclaw onboard` first\n", .{});
-        std.process.exit(1);
-    };
-    defer config.deinit();
-
-    const telegram_config = config.channels.telegram orelse {
-        std.debug.print("Telegram not configured. Add to config.json:\n", .{});
-        std.debug.print("  \"channels\": {{\"telegram\": {{\"accounts\": {{\"main\": {{\"bot_token\": \"...\"}}}}}}}}\n", .{});
-        std.process.exit(1);
-    };
-
-    // Determine allowed users: --user CLI args override config allow_from
-    var user_list: std.ArrayList([]const u8) = .empty;
-    defer user_list.deinit(allocator);
-    {
-        var i: usize = 0;
-        while (i < args.len) : (i += 1) {
-            if (std.mem.eql(u8, args[i], "--user") and i + 1 < args.len) {
-                i += 1;
-                user_list.append(allocator, args[i]) catch |err| log.err("failed to append user: {}", .{err});
-            }
-        }
-    }
-    const allowed: []const []const u8 = if (user_list.items.len > 0)
-        user_list.items
-    else
-        telegram_config.allow_from;
-
-    // OAuth providers (openai-codex) don't need an API key
-    const provider_kind = yc.providers.classifyProvider(config.default_provider);
-    if (config.defaultProviderKey() == null and provider_kind != .openai_codex_provider) {
-        std.debug.print("No API key configured. Add to ~/.nullclaw/config.json:\n", .{});
-        std.debug.print("  \"providers\": {{ \"{s}\": {{ \"api_key\": \"...\" }} }}\n", .{config.default_provider});
-        std.process.exit(1);
-    }
-
-    const model = config.default_model orelse "anthropic/claude-3.5-sonnet";
-    const temperature = config.default_temperature;
-
-    std.debug.print("nullclaw telegram bot starting...\n", .{});
-    std.debug.print("  Provider: {s}\n", .{config.default_provider});
-    std.debug.print("  Model: {s}\n", .{model});
-    std.debug.print("  Temperature: {d:.1}\n", .{temperature});
-    if (allowed.len == 0) {
-        std.debug.print("  Allowed users: (none — all messages will be denied)\n", .{});
-    } else if (allowed.len == 1 and std.mem.eql(u8, allowed[0], "*")) {
-        std.debug.print("  Allowed users: *\n", .{});
-    } else {
-        std.debug.print("  Allowed users:", .{});
-        for (allowed) |u| {
-            std.debug.print(" {s}", .{u});
-        }
-        std.debug.print("\n", .{});
-    }
-
-    var tg = yc.channels.telegram.TelegramChannel.init(allocator, telegram_config.bot_token, allowed);
-    tg.proxy = telegram_config.proxy;
-
-    // Set up transcription — key comes from providers.{audio_media.provider}
-    const trans = config.audio_media;
-    const whisper_ptr: ?*yc.voice.WhisperTranscriber = if (config.getProviderKey(trans.provider)) |key| blk: {
-        const wt = try allocator.create(yc.voice.WhisperTranscriber);
-        wt.* = .{
-            .endpoint = yc.voice.resolveTranscriptionEndpoint(trans.provider, trans.base_url),
-            .api_key = key,
-            .model = trans.model,
-            .language = trans.language,
-        };
-        break :blk wt;
-    } else null;
-    if (whisper_ptr) |wt| tg.transcriber = wt.transcriber();
-
-    // Initialize MCP tools from config
-    const mcp_tools: ?[]const yc.tools.Tool = if (config.mcp_servers.len > 0)
-        yc.mcp.initMcpTools(allocator, config.mcp_servers) catch |err| blk: {
-            std.debug.print("  MCP: init failed: {}\n", .{err});
-            break :blk null;
-        }
-    else
-        null;
-
-    // Build security policy from config
-    const security = @import("nullclaw").security.policy;
-    var tracker = security.RateTracker.init(allocator, config.autonomy.max_actions_per_hour);
-    defer tracker.deinit();
-
-    var sec_policy = security.SecurityPolicy{
-        .autonomy = config.autonomy.level,
-        .workspace_dir = config.workspace_dir,
-        .workspace_only = config.autonomy.workspace_only,
-        .allowed_commands = if (config.autonomy.allowed_commands.len > 0) config.autonomy.allowed_commands else &security.default_allowed_commands,
-        .max_actions_per_hour = config.autonomy.max_actions_per_hour,
-        .require_approval_for_medium_risk = config.autonomy.require_approval_for_medium_risk,
-        .block_high_risk_commands = config.autonomy.block_high_risk_commands,
-        .tracker = &tracker,
-    };
-
-    // Create tools (for system prompt and tool calling)
-    const tools = yc.tools.allTools(allocator, config.workspace_dir, .{
-        .http_enabled = config.http_request.enabled,
-        .browser_enabled = config.browser.enabled,
-        .screenshot_enabled = true,
-        .mcp_tools = mcp_tools,
-        .agents = config.agents,
-        .fallback_api_key = config.defaultProviderKey(),
-        .tools_config = config.tools,
-        .allowed_paths = config.autonomy.allowed_paths,
-        .policy = &sec_policy,
-    }) catch &.{};
-    defer if (tools.len > 0) allocator.free(tools);
-
-    if (mcp_tools) |mt| {
-        std.debug.print("  MCP tools: {d}\n", .{mt.len});
-    }
-
-    // Create optional memory backend (don't fail if unavailable)
-    var mem_opt: ?yc.memory.Memory = null;
-    const db_path = std.fs.path.joinZ(allocator, &.{ config.workspace_dir, "memory.db" }) catch null;
-    defer if (db_path) |p| allocator.free(p);
-    if (db_path) |p| {
-        if (yc.memory.createMemory(allocator, config.memory.backend, p)) |mem| {
-            mem_opt = mem;
-        } else |_| {}
-    }
-
-    // Create noop observer
-    var noop_obs = yc.observability.NoopObserver{};
-    const obs = noop_obs.observer();
-
-    // Create provider vtable — concrete struct must stay alive for the loop.
-    var holder = yc.providers.ProviderHolder.fromConfig(allocator, config.default_provider, config.defaultProviderKey(), config.getProviderBaseUrl(config.default_provider));
-    const provider_i: yc.providers.Provider = holder.provider();
-
-    std.debug.print("  Tools: {d} loaded\n", .{tools.len});
-    std.debug.print("  Memory: {s}\n", .{if (mem_opt != null) "enabled" else "disabled"});
-
-    // Register bot commands in Telegram's "/" menu
-    tg.setMyCommands();
-
-    // Skip messages accumulated while bot was offline
-    tg.dropPendingUpdates();
-
-    std.debug.print("  Polling for messages... (Ctrl+C to stop)\n\n", .{});
-
-    var session_mgr = yc.session.SessionManager.init(allocator, &config, provider_i, tools, mem_opt, obs);
-    session_mgr.policy = &sec_policy;
-    defer session_mgr.deinit();
-
-    var typing = yc.channels.telegram.TypingIndicator.init(&tg);
-    var evict_counter: u32 = 0;
-
-    // Bot loop: poll → full agent loop (tool calling) → reply
-    while (true) {
-        const messages = tg.pollUpdates(allocator) catch |err| {
-            std.debug.print("Poll error: {}\n", .{err});
-            std.Thread.sleep(5 * std.time.ns_per_s);
-            continue;
-        };
-
-        for (messages) |msg| {
-            std.debug.print("[{s}] {s}: {s}\n", .{ msg.channel, msg.id, msg.content });
-
-            // Handle /start command (Telegram-specific greeting, not sent to LLM)
-            const trimmed_content = std.mem.trim(u8, msg.content, " \t\r\n");
-            if (std.mem.eql(u8, trimmed_content, "/start")) {
-                var greeting_buf: [512]u8 = undefined;
-                const name = msg.first_name orelse msg.id;
-                const greeting = std.fmt.bufPrint(&greeting_buf, "Hello, {s}! I'm nullClaw.\n\nModel: {s}\nType /help for available commands.", .{ name, model }) catch "Hello! I'm nullClaw. Type /help for commands.";
-                tg.sendMessageWithReply(msg.sender, greeting, msg.message_id) catch |err| log.err("failed to send /start reply: {}", .{err});
-                continue;
-            }
-
-            // Determine reply-to: always in groups, configurable in private chats
-            const use_reply_to = msg.is_group or telegram_config.reply_in_private;
-            const reply_to_id: ?i64 = if (use_reply_to) msg.message_id else null;
-
-            // Session key: "telegram:{chat_id}"
-            var key_buf: [128]u8 = undefined;
-            const session_key = std.fmt.bufPrint(&key_buf, "telegram:{s}", .{msg.sender}) catch msg.sender;
-
-            // Start periodic typing indicator while LLM is thinking
-            typing.start(msg.sender);
-
-            const reply = session_mgr.processMessage(session_key, msg.content) catch |err| {
-                typing.stop();
-                std.debug.print("  Agent error: {}\n", .{err});
-                const err_msg = switch (err) {
-                    error.CurlFailed, error.CurlReadError, error.CurlWaitError => "Network error. Please try again.",
-                    error.OutOfMemory => "Out of memory.",
-                    else => "An error occurred. Try again or /new for a fresh session.",
-                };
-                tg.sendMessageWithReply(msg.sender, err_msg, reply_to_id) catch |send_err| log.err("failed to send error reply: {}", .{send_err});
-                continue;
-            };
-            defer allocator.free(reply);
-
-            typing.stop();
-
-            std.debug.print("  -> {s}\n", .{reply});
-
-            // Reply on telegram; handles [IMAGE:path] markers + split
-            tg.sendMessageWithReply(msg.sender, reply, reply_to_id) catch |err| {
-                std.debug.print("  Send error: {}\n", .{err});
-            };
-        }
-
-        if (messages.len > 0) {
-            // Free message memory
-            for (messages) |msg| {
-                allocator.free(msg.id);
-                allocator.free(msg.sender);
-                allocator.free(msg.content);
-                if (msg.first_name) |fn_| allocator.free(fn_);
-            }
-            allocator.free(messages);
-        }
-
-        // Periodically evict sessions idle longer than the configured timeout
-        evict_counter += 1;
-        if (evict_counter >= 100) {
-            evict_counter = 0;
-            _ = session_mgr.evictIdle(config.agent.session_idle_timeout_secs);
-        }
     }
 }
 
@@ -1475,7 +1234,7 @@ fn printUsage() void {
         \\  version     Show CLI version
         \\  doctor      Run diagnostics
         \\  cron        Manage scheduled tasks
-        \\  channel     Manage channels (Telegram, Discord, Slack, ...)
+        \\  channel     Manage channels (Discord, Slack)
         \\  skills      Manage skills
         \\  hardware    Discover and manage hardware
         \\  migrate     Migrate data from other agent runtimes

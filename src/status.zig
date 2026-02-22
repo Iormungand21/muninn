@@ -84,12 +84,9 @@ pub fn run(allocator: std.mem.Allocator) !void {
     // Channels
     try w.print("Channels:\n", .{});
     try w.print("  CLI:       always\n", .{});
-    try w.print("  Telegram:  {s}\n", .{if (cfg.channels.telegram != null) "configured" else "not configured"});
     try w.print("  Discord:   {s}\n", .{if (cfg.channels.discord != null) "configured" else "not configured"});
     try w.print("  Slack:     {s}\n", .{if (cfg.channels.slack != null) "configured" else "not configured"});
     try w.print("  Webhook:   {s}\n", .{if (cfg.channels.webhook != null) "configured" else "not configured"});
-    try w.print("  Matrix:    {s}\n", .{if (cfg.channels.matrix != null) "configured" else "not configured"});
-    try w.print("  IRC:       {s}\n", .{if (cfg.channels.irc != null) "configured" else "not configured"});
 
     try w.flush();
 }

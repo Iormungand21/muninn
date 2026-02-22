@@ -201,13 +201,13 @@ test "TypedRecord default fields" {
 
 test "SourceMeta fields" {
     const meta = SourceMeta{
-        .channel = "telegram",
+        .channel = "discord",
         .author = "user-42",
         .tool = "web_search",
         .session_id = "sess-abc",
         .ref = "https://example.com",
     };
-    try std.testing.expectEqualStrings("telegram", meta.channel.?);
+    try std.testing.expectEqualStrings("discord", meta.channel.?);
     try std.testing.expectEqualStrings("user-42", meta.author.?);
     try std.testing.expectEqualStrings("web_search", meta.tool.?);
 }

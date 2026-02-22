@@ -74,20 +74,15 @@ pub fn allIntegrations() []const IntegrationEntry {
 
 const all_integrations_list = [_]IntegrationEntry{
     // Chat Providers
-    .{ .name = "Telegram", .description = "Bot API -- long-polling", .category = .chat, .status = .available },
     .{ .name = "Discord", .description = "Servers, channels & DMs", .category = .chat, .status = .available },
     .{ .name = "Slack", .description = "Workspace apps via Web API", .category = .chat, .status = .available },
     .{ .name = "Webhooks", .description = "HTTP endpoint for triggers", .category = .chat, .status = .available },
-    .{ .name = "WhatsApp", .description = "Meta Cloud API via webhook", .category = .chat, .status = .available },
     .{ .name = "Signal", .description = "Privacy-focused via signal-cli", .category = .chat, .status = .coming_soon },
-    .{ .name = "iMessage", .description = "macOS AppleScript bridge", .category = .chat, .status = .available },
     .{ .name = "Microsoft Teams", .description = "Enterprise chat support", .category = .chat, .status = .coming_soon },
-    .{ .name = "Matrix", .description = "Matrix protocol (Element)", .category = .chat, .status = .available },
     .{ .name = "Nostr", .description = "Decentralized DMs (NIP-04)", .category = .chat, .status = .coming_soon },
     .{ .name = "WebChat", .description = "Browser-based chat UI", .category = .chat, .status = .coming_soon },
     .{ .name = "Nextcloud Talk", .description = "Self-hosted Nextcloud chat", .category = .chat, .status = .coming_soon },
     .{ .name = "Zalo", .description = "Zalo Bot API", .category = .chat, .status = .coming_soon },
-    .{ .name = "DingTalk", .description = "DingTalk Stream Mode", .category = .chat, .status = .available },
     // AI Models
     .{ .name = "OpenRouter", .description = "200+ models, 1 API key", .category = .ai_model, .status = .available },
     .{ .name = "Anthropic", .description = "Claude 3.5/4 Sonnet & Opus", .category = .ai_model, .status = .available },
@@ -155,8 +150,8 @@ const all_integrations_list = [_]IntegrationEntry{
     .{ .name = "macOS", .description = "Native support + AppleScript", .category = .platform, .status = .active },
     .{ .name = "Linux", .description = "Native support", .category = .platform, .status = .available },
     .{ .name = "Windows", .description = "WSL2 recommended", .category = .platform, .status = .available },
-    .{ .name = "iOS", .description = "Chat via Telegram/Discord", .category = .platform, .status = .available },
-    .{ .name = "Android", .description = "Chat via Telegram/Discord", .category = .platform, .status = .available },
+    .{ .name = "iOS", .description = "Chat via Discord/Slack", .category = .platform, .status = .available },
+    .{ .name = "Android", .description = "Chat via Discord/Slack", .category = .platform, .status = .available },
 };
 
 /// Look up an integration by name (case-insensitive).
@@ -227,17 +222,17 @@ test "category all includes every variant once" {
     try std.testing.expectEqual(@as(usize, 9), all.len);
 }
 
-test "findIntegration finds Telegram" {
-    const entry = findIntegration("Telegram");
+test "findIntegration finds Discord" {
+    const entry = findIntegration("Discord");
     try std.testing.expect(entry != null);
-    try std.testing.expectEqualStrings("Telegram", entry.?.name);
+    try std.testing.expectEqualStrings("Discord", entry.?.name);
     try std.testing.expectEqual(IntegrationCategory.chat, entry.?.category);
 }
 
 test "findIntegration is case-insensitive" {
-    const entry = findIntegration("telegram");
+    const entry = findIntegration("discord");
     try std.testing.expect(entry != null);
-    try std.testing.expectEqualStrings("Telegram", entry.?.name);
+    try std.testing.expectEqualStrings("Discord", entry.?.name);
 }
 
 test "findIntegration returns null for unknown" {

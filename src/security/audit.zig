@@ -284,10 +284,10 @@ test "audit event init creates unique ids" {
 
 test "audit event with actor" {
     const event = AuditEvent.init(.command_execution)
-        .withActor("telegram", "123", "@alice");
+        .withActor("discord", "123", "@alice");
     try std.testing.expect(event.actor != null);
     const actor = event.actor.?;
-    try std.testing.expectEqualStrings("telegram", actor.channel);
+    try std.testing.expectEqualStrings("discord", actor.channel);
     try std.testing.expectEqualStrings("123", actor.user_id.?);
     try std.testing.expectEqualStrings("@alice", actor.username.?);
 }
@@ -303,7 +303,7 @@ test "audit event with action" {
 
 test "audit event serializes to json" {
     var event = AuditEvent.init(.command_execution)
-        .withActor("telegram", null, null)
+        .withActor("discord", null, null)
         .withAction("ls", "low", false, true)
         .withResult(true, 0, 15, null);
 
@@ -311,7 +311,7 @@ test "audit event serializes to json" {
     const json = try event.writeJson(&buf);
     // Should contain key fields
     try std.testing.expect(std.mem.indexOf(u8, json, "command_execution") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "telegram") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "discord") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"success\":true") != null);
 }
 

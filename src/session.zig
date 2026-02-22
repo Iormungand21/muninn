@@ -1,7 +1,7 @@
 //! Session Manager — persistent in-process Agent sessions.
 //!
 //! Replaces subprocess spawning with reusable Agent instances keyed by
-//! session_key (e.g. "telegram:chat123"). Each session maintains its own
+//! session_key (e.g. "discord:chat123"). Each session maintains its own
 //! conversation history across turns.
 //!
 //! Thread safety: SessionManager.mutex guards the sessions map (short hold),
@@ -326,9 +326,9 @@ test "getOrCreate creates new session for unknown key" {
     var sm = testSessionManager(testing.allocator, &mock, &cfg);
     defer sm.deinit();
 
-    const session = try sm.getOrCreate("telegram:chat1");
+    const session = try sm.getOrCreate("discord:chat1");
     try testing.expect(session.turn_count == 0);
-    try testing.expectEqualStrings("telegram:chat1", session.session_key);
+    try testing.expectEqualStrings("discord:chat1", session.session_key);
 }
 
 test "getOrCreate returns same session for same key" {
@@ -348,7 +348,7 @@ test "getOrCreate creates separate sessions for different keys" {
     var sm = testSessionManager(testing.allocator, &mock, &cfg);
     defer sm.deinit();
 
-    const s1 = try sm.getOrCreate("telegram:a");
+    const s1 = try sm.getOrCreate("discord:a");
     const s2 = try sm.getOrCreate("discord:b");
     try testing.expect(s1 != s2);
 }

@@ -1,18 +1,10 @@
 //! Channels — messaging platform integrations.
 //! Each channel implements the Channel interface (vtable-based polymorphism).
 //!
-//! Channels (matching ZeroClaw):
+//! Channels:
 //!   - CLI (built-in stdin/stdout)
-//!   - Telegram (long-polling)
 //!   - Discord (WebSocket gateway)
 //!   - Slack (polling conversations.history)
-//!   - WhatsApp (webhook-based)
-//!   - Matrix (long-polling /sync)
-//!   - IRC (TLS socket)
-//!   - iMessage (AppleScript + SQLite on macOS)
-//!   - Email (IMAP/SMTP)
-//!   - Lark/Feishu (HTTP callback)
-//!   - DingTalk (WebSocket stream mode)
 
 const std = @import("std");
 
@@ -27,9 +19,9 @@ pub const ChannelMessage = struct {
     content: []const u8,
     channel: []const u8,
     timestamp: u64,
-    /// Where to send a reply (e.g., DM sender vs channel name in IRC, thread ID in Telegram).
+    /// Where to send a reply (e.g., DM sender vs channel ID in Discord).
     reply_target: ?[]const u8 = null,
-    /// Platform message ID (e.g. Telegram message_id for reply-to).
+    /// Platform message ID (e.g. Discord message snowflake for reply-to).
     message_id: ?i64 = null,
     /// Sender's first name (for personalized greetings).
     first_name: ?[]const u8 = null,
@@ -59,7 +51,7 @@ pub const Channel = struct {
         stop: *const fn (ptr: *anyopaque) void,
         /// Send a message to a target (user, channel, room, etc.).
         send: *const fn (ptr: *anyopaque, target: []const u8, message: []const u8) anyerror!void,
-        /// Return the channel name (e.g. "telegram", "discord").
+        /// Return the channel name (e.g. "discord", "slack").
         name: *const fn (ptr: *anyopaque) []const u8,
         /// Health check — return true if the channel is operational.
         healthCheck: *const fn (ptr: *anyopaque) bool,
@@ -91,20 +83,8 @@ pub const Channel = struct {
 // ════════════════════════════════════════════════════════════════════════════
 
 pub const cli = @import("cli.zig");
-pub const telegram = @import("telegram.zig");
 pub const discord = @import("discord.zig");
 pub const slack = @import("slack.zig");
-pub const whatsapp = @import("whatsapp.zig");
-pub const matrix = @import("matrix.zig");
-pub const irc = @import("irc.zig");
-pub const imessage = @import("imessage.zig");
-pub const email = @import("email.zig");
-pub const lark = @import("lark.zig");
-pub const dingtalk = @import("dingtalk.zig");
-pub const line = @import("line.zig");
-pub const onebot = @import("onebot.zig");
-pub const qq = @import("qq.zig");
-pub const maixcam = @import("maixcam.zig");
 pub const dispatch = @import("dispatch.zig");
 
 // ════════════════════════════════════════════════════════════════════════════

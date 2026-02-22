@@ -1119,7 +1119,7 @@ test "deliverResult creates correct OutboundMessage" {
 
     const delivery = DeliveryConfig{
         .mode = .always,
-        .channel = "telegram",
+        .channel = "discord",
         .to = "chat123",
     };
 
@@ -1129,7 +1129,7 @@ test "deliverResult creates correct OutboundMessage" {
     // Consume and verify the message
     var msg = test_bus.consumeOutbound().?;
     defer msg.deinit(allocator);
-    try std.testing.expectEqualStrings("telegram", msg.channel);
+    try std.testing.expectEqualStrings("discord", msg.channel);
     try std.testing.expectEqualStrings("chat123", msg.chat_id);
     try std.testing.expectEqualStrings("job output here", msg.content);
 }
@@ -1141,7 +1141,7 @@ test "deliverResult with mode none does nothing" {
 
     const delivery = DeliveryConfig{
         .mode = .none,
-        .channel = "telegram",
+        .channel = "discord",
         .to = "chat1",
     };
 
@@ -1173,7 +1173,7 @@ test "deliverResult on_success skips on failure" {
 
     const delivery = DeliveryConfig{
         .mode = .on_success,
-        .channel = "telegram",
+        .channel = "discord",
         .to = "chat1",
     };
 
@@ -1189,7 +1189,7 @@ test "deliverResult on_error skips on success" {
 
     const delivery = DeliveryConfig{
         .mode = .on_error,
-        .channel = "telegram",
+        .channel = "discord",
         .to = "chat1",
     };
 
@@ -1245,7 +1245,7 @@ test "deliverResult skips empty output" {
 
     const delivery = DeliveryConfig{
         .mode = .always,
-        .channel = "telegram",
+        .channel = "discord",
         .to = "chat1",
     };
 
@@ -1261,7 +1261,7 @@ test "deliverResult best_effort swallows closed bus error" {
 
     const delivery = DeliveryConfig{
         .mode = .always,
-        .channel = "telegram",
+        .channel = "discord",
         .to = "chat1",
         .best_effort = true,
     };
@@ -1305,7 +1305,7 @@ test "shell job delivers stdout via bus" {
     // Configure delivery
     scheduler.jobs.items[0].delivery = .{
         .mode = .always,
-        .channel = "telegram",
+        .channel = "discord",
         .to = "chat99",
     };
     scheduler.jobs.items[0].next_run_secs = 0;
@@ -1316,7 +1316,7 @@ test "shell job delivers stdout via bus" {
     try std.testing.expect(test_bus.outboundDepth() > 0);
     var msg = test_bus.consumeOutbound().?;
     defer msg.deinit(allocator);
-    try std.testing.expectEqualStrings("telegram", msg.channel);
+    try std.testing.expectEqualStrings("discord", msg.channel);
     try std.testing.expectEqualStrings("chat99", msg.chat_id);
     // The content should contain "hello_cron" from the echo command
     try std.testing.expect(std.mem.indexOf(u8, msg.content, "hello_cron") != null);

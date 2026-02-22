@@ -19,17 +19,9 @@ pub const AgentConfig = config_types.AgentConfig;
 pub const ModelRouteConfig = config_types.ModelRouteConfig;
 pub const HeartbeatConfig = config_types.HeartbeatConfig;
 pub const CronConfig = config_types.CronConfig;
-pub const TelegramConfig = config_types.TelegramConfig;
 pub const DiscordConfig = config_types.DiscordConfig;
 pub const SlackConfig = config_types.SlackConfig;
 pub const WebhookConfig = config_types.WebhookConfig;
-pub const IMessageConfig = config_types.IMessageConfig;
-pub const MatrixConfig = config_types.MatrixConfig;
-pub const WhatsAppConfig = config_types.WhatsAppConfig;
-pub const IrcConfig = config_types.IrcConfig;
-pub const LarkReceiveMode = config_types.LarkReceiveMode;
-pub const LarkConfig = config_types.LarkConfig;
-pub const DingTalkConfig = config_types.DingTalkConfig;
 pub const ChannelsConfig = config_types.ChannelsConfig;
 pub const MemoryConfig = config_types.MemoryConfig;
 pub const TunnelConfig = config_types.TunnelConfig;
@@ -1300,26 +1292,6 @@ test "tools.media.audio disabled" {
     try std.testing.expectEqualStrings("groq", cfg.audio_media.provider);
 }
 
-test "parse telegram accounts" {
-    const allocator = std.testing.allocator;
-    const json =
-        \\{"channels": {"telegram": {"accounts": {"main": {"bot_token": "123:ABC", "allow_from": ["user1"], "reply_in_private": false, "proxy": "socks5://host:1080"}}}}}
-    ;
-    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
-    try cfg.parseJson(json);
-    try std.testing.expect(cfg.channels.telegram != null);
-    const tg = cfg.channels.telegram.?;
-    try std.testing.expectEqualStrings("123:ABC", tg.bot_token);
-    try std.testing.expectEqual(@as(usize, 1), tg.allow_from.len);
-    try std.testing.expectEqualStrings("user1", tg.allow_from[0]);
-    try std.testing.expect(!tg.reply_in_private);
-    try std.testing.expectEqualStrings("socks5://host:1080", tg.proxy.?);
-    allocator.free(tg.bot_token);
-    for (tg.allow_from) |u| allocator.free(u);
-    allocator.free(tg.allow_from);
-    allocator.free(tg.proxy.?);
-}
-
 test "parse discord accounts" {
     const allocator = std.testing.allocator;
     const json =
@@ -1353,112 +1325,6 @@ test "parse slack accounts" {
     allocator.free(sc.app_token.?);
     for (sc.allow_from) |u| allocator.free(u);
     allocator.free(sc.allow_from);
-}
-
-test "parse irc accounts" {
-    const allocator = std.testing.allocator;
-    const json =
-        \\{"channels": {"irc": {"accounts": {"freenode": {"host": "irc.libera.chat", "nick": "bot", "port": 6667, "channels": ["#test"]}}}}}
-    ;
-    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
-    try cfg.parseJson(json);
-    try std.testing.expect(cfg.channels.irc != null);
-    const ic = cfg.channels.irc.?;
-    try std.testing.expectEqualStrings("irc.libera.chat", ic.host);
-    try std.testing.expectEqualStrings("bot", ic.nick);
-    try std.testing.expectEqual(@as(u16, 6667), ic.port);
-    try std.testing.expectEqual(@as(usize, 1), ic.channels.len);
-    allocator.free(ic.host);
-    allocator.free(ic.nick);
-    for (ic.channels) |c| allocator.free(c);
-    allocator.free(ic.channels);
-}
-
-test "parse matrix accounts" {
-    const allocator = std.testing.allocator;
-    const json =
-        \\{"channels": {"matrix": {"accounts": {"main": {"homeserver": "https://matrix.org", "access_token": "syt_abc", "room_id": "!room:matrix.org"}}}}}
-    ;
-    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
-    try cfg.parseJson(json);
-    try std.testing.expect(cfg.channels.matrix != null);
-    const mc = cfg.channels.matrix.?;
-    try std.testing.expectEqualStrings("https://matrix.org", mc.homeserver);
-    try std.testing.expectEqualStrings("syt_abc", mc.access_token);
-    try std.testing.expectEqualStrings("!room:matrix.org", mc.room_id);
-    allocator.free(mc.homeserver);
-    allocator.free(mc.access_token);
-    allocator.free(mc.room_id);
-}
-
-test "parse lark accounts" {
-    const allocator = std.testing.allocator;
-    const json =
-        \\{"channels": {"lark": {"accounts": {"main": {"app_id": "cli_abc", "app_secret": "sec123", "use_feishu": true}}}}}
-    ;
-    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
-    try cfg.parseJson(json);
-    try std.testing.expect(cfg.channels.lark != null);
-    const lc = cfg.channels.lark.?;
-    try std.testing.expectEqualStrings("cli_abc", lc.app_id);
-    try std.testing.expectEqualStrings("sec123", lc.app_secret);
-    try std.testing.expect(lc.use_feishu);
-    allocator.free(lc.app_id);
-    allocator.free(lc.app_secret);
-}
-
-test "parse dingtalk accounts" {
-    const allocator = std.testing.allocator;
-    const json =
-        \\{"channels": {"dingtalk": {"accounts": {"main": {"client_id": "cid", "client_secret": "csec", "allow_from": ["u1"]}}}}}
-    ;
-    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
-    try cfg.parseJson(json);
-    try std.testing.expect(cfg.channels.dingtalk != null);
-    const dc = cfg.channels.dingtalk.?;
-    try std.testing.expectEqualStrings("cid", dc.client_id);
-    try std.testing.expectEqualStrings("csec", dc.client_secret);
-    allocator.free(dc.client_id);
-    allocator.free(dc.client_secret);
-    for (dc.allow_from) |u| allocator.free(u);
-    allocator.free(dc.allow_from);
-}
-
-test "parse whatsapp accounts" {
-    const allocator = std.testing.allocator;
-    const json =
-        \\{"channels": {"whatsapp": {"accounts": {"main": {"access_token": "wa-tok", "phone_number_id": "12345", "verify_token": "vtok", "app_secret": "sec", "allow_from": ["+1234"]}}}}}
-    ;
-    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
-    try cfg.parseJson(json);
-    try std.testing.expect(cfg.channels.whatsapp != null);
-    const wc = cfg.channels.whatsapp.?;
-    try std.testing.expectEqualStrings("wa-tok", wc.access_token);
-    try std.testing.expectEqualStrings("12345", wc.phone_number_id);
-    try std.testing.expectEqualStrings("vtok", wc.verify_token);
-    try std.testing.expectEqualStrings("sec", wc.app_secret.?);
-    try std.testing.expectEqual(@as(usize, 1), wc.allow_from.len);
-    allocator.free(wc.access_token);
-    allocator.free(wc.phone_number_id);
-    allocator.free(wc.verify_token);
-    allocator.free(wc.app_secret.?);
-    for (wc.allow_from) |u| allocator.free(u);
-    allocator.free(wc.allow_from);
-}
-
-test "parse imessage config" {
-    const allocator = std.testing.allocator;
-    const json =
-        \\{"channels": {"imessage": {"enabled": true, "allow_from": ["user@icloud.com"]}}}
-    ;
-    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
-    try cfg.parseJson(json);
-    try std.testing.expect(cfg.channels.imessage != null);
-    const ic = cfg.channels.imessage.?;
-    try std.testing.expect(ic.enabled);
-    try std.testing.expectEqual(@as(usize, 1), ic.allow_from.len);
-    for (ic.allow_from) |u| allocator.free(u);
-    allocator.free(ic.allow_from);
 }
 
 test "json parse reasoning_effort" {

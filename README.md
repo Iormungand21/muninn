@@ -18,7 +18,7 @@
 The smallest fully autonomous AI assistant infrastructure — a static Zig binary that fits on any $5 board, boots in milliseconds, and requires nothing but libc.
 
 ```
-678 KB binary · <2 ms startup · 2,843 tests · 22+ providers · 13 channels · Pluggable everything
+678 KB binary · <2 ms startup · 2,852 tests · 22+ providers · 4 channels · Pluggable everything
 ```
 
 ### Features
@@ -27,7 +27,7 @@ The smallest fully autonomous AI assistant infrastructure — a static Zig binar
 - **Near-Zero Memory:** ~1 MB peak RSS. Runs comfortably on the cheapest ARM SBCs and microcontrollers.
 - **Instant Startup:** <2 ms on Apple Silicon, <8 ms on a 0.8 GHz edge core.
 - **True Portability:** Single self-contained binary across ARM, x86, and RISC-V. Drop it anywhere, it just runs.
-- **Feature-Complete:** 22+ providers, 11 channels, 18+ tools, hybrid vector+FTS5 memory, multi-layer sandbox, tunnels, hardware peripherals, MCP, subagents, streaming, voice — the full stack.
+- **Feature-Complete:** 22+ providers, 4 channels, 18+ tools, hybrid vector+FTS5 memory, multi-layer sandbox, tunnels, hardware peripherals, MCP, subagents, streaming, voice — the full stack.
 
 ### Why nullclaw
 
@@ -46,7 +46,7 @@ Local machine benchmark (macOS arm64, Feb 2026), normalized for 0.8 GHz edge har
 | **RAM** | > 1 GB | > 100 MB | < 10 MB | < 5 MB | **~1 MB** |
 | **Startup (0.8 GHz)** | > 500 s | > 30 s | < 1 s | < 10 ms | **< 8 ms** |
 | **Binary Size** | ~28 MB (dist) | N/A (Scripts) | ~8 MB | 3.4 MB | **678 KB** |
-| **Tests** | — | — | — | 1,017 | **2,843** |
+| **Tests** | — | — | — | 1,017 | **2,852** |
 | **Source Files** | ~400+ | — | — | ~120 | **~110** |
 | **Cost** | Mac Mini $599 | Linux SBC ~$50 | Linux Board $10 | Any $10 hardware | **Any $5 hardware** |
 
@@ -115,7 +115,7 @@ Every subsystem is a **vtable interface** — swap implementations with a config
 | Subsystem | Interface | Ships with | Extend |
 |-----------|-----------|------------|--------|
 | **AI Models** | `Provider` | 22+ providers (OpenRouter, Anthropic, OpenAI, Ollama, Venice, Groq, Mistral, xAI, DeepSeek, Together, Fireworks, Perplexity, Cohere, Bedrock, etc.) | `custom:https://your-api.com` — any OpenAI-compatible API |
-| **Channels** | `Channel` | CLI, Telegram, Discord, Slack, iMessage, Matrix, WhatsApp, Webhook, IRC, Lark/Feishu, DingTalk, QQ, MaixCam | Any messaging API |
+| **Channels** | `Channel` | CLI, Discord, Slack, Webhook | Any messaging API |
 | **Memory** | `Memory` | SQLite with hybrid search (FTS5 + vector cosine similarity), Markdown | Any persistence backend |
 | **Tools** | `Tool` | shell, file_read, file_write, file_edit, memory_store, memory_recall, memory_forget, browser_open, screenshot, composio, http_request, hardware_info, hardware_memory, and more | Any capability |
 | **Observability** | `Observer` | Noop, Log, File, Multi | Prometheus, OTel |
@@ -206,16 +206,6 @@ Config: `~/.nullclaw/config.json` (created by `onboard`)
   },
 
   "channels": {
-    "telegram": {
-      "accounts": {
-        "main": {
-          "bot_token": "123:ABC",
-          "allow_from": ["user1"],
-          "reply_in_private": true,
-          "proxy": "socks5://..."
-        }
-      }
-    },
     "discord": {
       "accounts": {
         "main": {
@@ -223,18 +213,6 @@ Config: `~/.nullclaw/config.json` (created by `onboard`)
           "guild_id": "12345",
           "allow_from": ["user1"],
           "allow_bots": false
-        }
-      }
-    },
-    "irc": {
-      "accounts": {
-        "main": {
-          "host": "irc.libera.chat",
-          "port": 6697,
-          "nick": "nullclaw",
-          "channel": "#nullclaw",
-          "tls": true,
-          "allow_from": ["user1"]
         }
       }
     },
@@ -313,8 +291,6 @@ Config: `~/.nullclaw/config.json` (created by `onboard`)
 | `/health` | GET | None | Health check (always public) |
 | `/pair` | POST | `X-Pairing-Code` header | Exchange one-time code for bearer token |
 | `/webhook` | POST | `Authorization: Bearer <token>` | Send message: `{"message": "your prompt"}` |
-| `/whatsapp` | GET | Query params | Meta webhook verification |
-| `/whatsapp` | POST | None (Meta signature) | WhatsApp incoming message webhook |
 
 ## Commands
 
@@ -342,7 +318,7 @@ Config: `~/.nullclaw/config.json` (created by `onboard`)
 ```bash
 zig build                          # Dev build
 zig build -Doptimize=ReleaseSmall  # Release build (678 KB)
-zig build test --summary all       # 2,843 tests
+zig build test --summary all       # 2,852 tests
 ```
 
 ### Project Stats
@@ -351,7 +327,7 @@ zig build test --summary all       # 2,843 tests
 Language:     Zig 0.15
 Source files: ~110
 Lines of code: ~45,000
-Tests:        2,843
+Tests:        2,852
 Binary:       678 KB (ReleaseSmall)
 Peak RSS:     ~1 MB
 Startup:      <2 ms (Apple Silicon)
@@ -368,7 +344,7 @@ src/
   agent.zig             Agent loop, auto-compaction, tool dispatch
   daemon.zig            Daemon supervisor with exponential backoff
   gateway.zig           HTTP gateway (rate limiting, idempotency, pairing)
-  channels/             11 channel implementations (telegram, discord, slack, ...)
+  channels/             4 channel implementations (cli, discord, slack, webhook)
   providers/            22+ AI provider implementations
   memory/               SQLite backend, embeddings, vector search, hygiene, snapshots
   tools/                18 tool implementations

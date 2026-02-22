@@ -516,16 +516,9 @@ pub fn runChannelsOnly(allocator: std.mem.Allocator) !void {
     defer cfg.deinit();
 
     try stdout.print("  CLI:       {s}\n", .{if (cfg.channels.cli) "enabled" else "disabled"});
-    try stdout.print("  Telegram:  {s}\n", .{if (cfg.channels.telegram != null) "configured" else "not configured"});
     try stdout.print("  Discord:   {s}\n", .{if (cfg.channels.discord != null) "configured" else "not configured"});
     try stdout.print("  Slack:     {s}\n", .{if (cfg.channels.slack != null) "configured" else "not configured"});
     try stdout.print("  Webhook:   {s}\n", .{if (cfg.channels.webhook != null) "configured" else "not configured"});
-    try stdout.print("  iMessage:  {s}\n", .{if (cfg.channels.imessage != null) "configured" else "not configured"});
-    try stdout.print("  Matrix:    {s}\n", .{if (cfg.channels.matrix != null) "configured" else "not configured"});
-    try stdout.print("  WhatsApp:  {s}\n", .{if (cfg.channels.whatsapp != null) "configured" else "not configured"});
-    try stdout.print("  IRC:       {s}\n", .{if (cfg.channels.irc != null) "configured" else "not configured"});
-    try stdout.print("  Lark:      {s}\n", .{if (cfg.channels.lark != null) "configured" else "not configured"});
-    try stdout.print("  DingTalk:  {s}\n", .{if (cfg.channels.dingtalk != null) "configured" else "not configured"});
     try stdout.writeAll("\nTo modify channels, edit your config file:\n");
     try stdout.print("  {s}\n", .{cfg.config_path});
     try stdout.flush();

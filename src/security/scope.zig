@@ -18,7 +18,7 @@ pub const SecretScope = enum {
     global,
     /// Restricted to the owning workspace only.
     workspace,
-    /// Restricted to a specific channel type (e.g. telegram, discord).
+    /// Restricted to a specific channel type (e.g. discord, slack).
     channel,
 
     pub fn default() SecretScope {
@@ -47,7 +47,7 @@ pub const SecretScope = enum {
 /// (empty list = owning workspace only).
 /// When `.channel`, only channels listed in `allowed_channels` may access it.
 pub const ScopedSecretEntry = struct {
-    /// Identifier for this secret (e.g. "openai_api_key", "telegram_bot_token").
+    /// Identifier for this secret (e.g. "openai_api_key", "discord_bot_token").
     name: []const u8 = "",
     /// Visibility scope.
     scope: SecretScope = .global,
@@ -206,7 +206,7 @@ test "ScopedSecretEntry defaults" {
 
 test "isSecretAccessible: global scope always accessible" {
     const entry = ScopedSecretEntry{ .name = "api_key", .scope = .global };
-    try std.testing.expect(isSecretAccessible(&entry, "ws1", "telegram"));
+    try std.testing.expect(isSecretAccessible(&entry, "ws1", "discord"));
     try std.testing.expect(isSecretAccessible(&entry, "", ""));
     try std.testing.expect(isSecretAccessible(&entry, "any", "any"));
 }
@@ -214,7 +214,7 @@ test "isSecretAccessible: global scope always accessible" {
 test "isSecretAccessible: workspace scope empty list" {
     const entry = ScopedSecretEntry{ .name = "key", .scope = .workspace };
     // Empty allowed_workspaces = owning workspace only (skeleton returns true)
-    try std.testing.expect(isSecretAccessible(&entry, "owner_ws", "telegram"));
+    try std.testing.expect(isSecretAccessible(&entry, "owner_ws", "discord"));
 }
 
 test "isSecretAccessible: workspace scope with explicit list" {
@@ -233,21 +233,21 @@ test "isSecretAccessible: workspace scope with explicit list" {
 test "isSecretAccessible: channel scope empty list" {
     const entry = ScopedSecretEntry{ .name = "key", .scope = .channel };
     // Empty allowed_channels = all channels
-    try std.testing.expect(isSecretAccessible(&entry, "ws1", "telegram"));
+    try std.testing.expect(isSecretAccessible(&entry, "ws1", "discord"));
     try std.testing.expect(isSecretAccessible(&entry, "ws1", "discord"));
 }
 
 test "isSecretAccessible: channel scope with explicit list" {
-    const allowed = [_][]const u8{ "telegram", "slack" };
+    const allowed = [_][]const u8{ "discord", "slack" };
     const entry = ScopedSecretEntry{
         .name = "bot_token",
         .scope = .channel,
         .allowed_channels = &allowed,
     };
-    try std.testing.expect(isSecretAccessible(&entry, "ws1", "telegram"));
+    try std.testing.expect(isSecretAccessible(&entry, "ws1", "discord"));
     try std.testing.expect(isSecretAccessible(&entry, "ws1", "slack"));
-    try std.testing.expect(!isSecretAccessible(&entry, "ws1", "discord"));
-    try std.testing.expect(!isSecretAccessible(&entry, "ws1", "irc"));
+    try std.testing.expect(!isSecretAccessible(&entry, "ws1", "cli"));
+    try std.testing.expect(!isSecretAccessible(&entry, "ws1", "webhook"));
 }
 
 test "WorkspaceApprovalPolicy defaults" {

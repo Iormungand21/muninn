@@ -318,108 +318,6 @@ fn curlPostFromFile(
     return stdout;
 }
 
-// ════════════════════════════════════════════════════════════════════════════
-// Telegram Voice Integration
-// ════════════════════════════════════════════════════════════════════════════
-
-/// Download a Telegram voice/audio file and transcribe it.
-/// Returns the transcribed text, or null if transcription is unavailable
-/// (no Transcriber configured or file download fails).
-pub fn transcribeTelegramVoice(
-    allocator: std.mem.Allocator,
-    bot_token: []const u8,
-    file_id: []const u8,
-    t: ?Transcriber,
-) ?[]const u8 {
-    const transcr = t orelse return null;
-
-    // 1. Call getFile to get file_path
-    const tg_file_path = getFilePath(allocator, bot_token, file_id) catch |err| {
-        log.err("getFile failed: {}", .{err});
-        return null;
-    };
-    defer allocator.free(tg_file_path);
-
-    // 2. Download file via Telegram API
-    const local_path = downloadTelegramFile(allocator, bot_token, tg_file_path) catch |err| {
-        log.err("download failed: {}", .{err});
-        return null;
-    };
-    defer {
-        // Clean up temp file
-        std.fs.deleteFileAbsolute(local_path) catch {};
-        allocator.free(local_path);
-    }
-
-    // 3. Transcribe via vtable
-    const text = transcr.transcribe(allocator, local_path) catch |err| {
-        log.err("transcription failed: {}", .{err});
-        return null;
-    };
-
-    return text;
-}
-
-/// Call Telegram getFile API and extract the file_path from the response.
-fn getFilePath(allocator: std.mem.Allocator, bot_token: []const u8, file_id: []const u8) ![]u8 {
-    var url_buf: [512]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&url_buf);
-    try fbs.writer().print("https://api.telegram.org/bot{s}/getFile", .{bot_token});
-    const url = fbs.getWritten();
-
-    // Build request body
-    var body_list: std.ArrayListUnmanaged(u8) = .empty;
-    defer body_list.deinit(allocator);
-    try body_list.appendSlice(allocator, "{\"file_id\":");
-    try json_util.appendJsonString(&body_list, allocator, file_id);
-    try body_list.appendSlice(allocator, "}");
-
-    const resp = try http_util.curlPost(allocator, url, body_list.items, &.{});
-    defer allocator.free(resp);
-
-    // Parse response
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, resp, .{}) catch
-        return error.InvalidResponse;
-    defer parsed.deinit();
-
-    const result = parsed.value.object.get("result") orelse return error.InvalidResponse;
-    const fp_val = result.object.get("file_path") orelse return error.InvalidResponse;
-    if (fp_val != .string) return error.InvalidResponse;
-    return try allocator.dupe(u8, fp_val.string);
-}
-
-/// Download a file from Telegram and save to temp dir. Returns the local path (owned).
-fn downloadTelegramFile(allocator: std.mem.Allocator, bot_token: []const u8, tg_file_path: []const u8) ![]u8 {
-    var url_buf: [1024]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&url_buf);
-    try fbs.writer().print("https://api.telegram.org/file/bot{s}/{s}", .{ bot_token, tg_file_path });
-    const url = fbs.getWritten();
-
-    const data = try http_util.curlGet(allocator, url, &.{}, "30");
-    defer allocator.free(data);
-
-    // Save to temp file (platform-aware temp dir)
-    const tmp_dir = platform.getTempDir(allocator) catch return error.OutOfMemory;
-    defer allocator.free(tmp_dir);
-    const pid = getPid();
-    var path_buf: [256]u8 = undefined;
-    var path_fbs = std.io.fixedBufferStream(&path_buf);
-    try path_fbs.writer().print("{s}/nullclaw_tg_voice_{d}.ogg", .{ tmp_dir, pid });
-    const local_path = path_fbs.getWritten();
-
-    var z_buf: [256]u8 = undefined;
-    @memcpy(z_buf[0..local_path.len], local_path);
-    z_buf[local_path.len] = 0;
-    const local_path_z: [:0]const u8 = z_buf[0..local_path.len :0];
-
-    {
-        const f = try std.fs.createFileAbsolute(local_path_z, .{});
-        defer f.close();
-        try f.writeAll(data);
-    }
-
-    return try allocator.dupe(u8, local_path);
-}
 
 // ════════════════════════════════════════════════════════════════════════════
 // Tests
@@ -543,12 +441,6 @@ test "voice transcribeFile returns error for nonexistent file" {
     const allocator = std.testing.allocator;
     const result = transcribeFile(allocator, "fake_key", "https://api.groq.com/openai/v1/audio/transcriptions", "/nonexistent/path/audio.ogg", .{});
     try std.testing.expectError(error.FileReadFailed, result);
-}
-
-test "voice transcribeTelegramVoice returns null without transcriber" {
-    // No transcriber configured, so should return null
-    const result = transcribeTelegramVoice(std.testing.allocator, "fake:token", "fake_file_id", null);
-    try std.testing.expect(result == null);
 }
 
 test "voice WhisperTranscriber stores fields" {

@@ -6,7 +6,7 @@
 //!   - Body size limits (64KB max)
 //!   - Request timeouts (30s)
 //!   - Bearer token authentication (PairingGuard)
-//!   - Endpoints: /health, /ready, /pair, /webhook, /whatsapp, /telegram
+//!   - Endpoints: /health, /ready, /pair, /webhook
 //!
 //! Uses std.http.Server (built-in, no external deps).
 
@@ -204,23 +204,13 @@ pub const GatewayState = struct {
     allocator: std.mem.Allocator,
     rate_limiter: GatewayRateLimiter,
     idempotency: IdempotencyStore,
-    whatsapp_verify_token: []const u8,
-    whatsapp_app_secret: []const u8,
-    telegram_bot_token: []const u8,
     pairing_guard: ?PairingGuard,
 
     pub fn init(allocator: std.mem.Allocator) GatewayState {
-        return initWithVerifyToken(allocator, "");
-    }
-
-    pub fn initWithVerifyToken(allocator: std.mem.Allocator, verify_token: []const u8) GatewayState {
         return .{
             .allocator = allocator,
             .rate_limiter = GatewayRateLimiter.init(10, 30),
             .idempotency = IdempotencyStore.init(300),
-            .whatsapp_verify_token = verify_token,
-            .whatsapp_app_secret = "",
-            .telegram_bot_token = "",
             .pairing_guard = null,
         };
     }
@@ -396,71 +386,6 @@ fn asciiEqlIgnoreCase(a: []const u8, b: []const u8) bool {
     return true;
 }
 
-// ── WhatsApp HMAC-SHA256 Signature Verification ─────────────────
-
-/// Verify a WhatsApp webhook HMAC-SHA256 signature.
-///
-/// Meta sends `X-Hub-Signature-256: sha256=<hex-digest>` on every webhook POST.
-/// This function computes HMAC-SHA256 over `body` using `app_secret` as the key,
-/// then performs a constant-time comparison against the hex digest in the header.
-///
-/// Returns `true` if the signature is valid, `false` otherwise.
-pub fn verifyWhatsappSignature(body: []const u8, signature_header: []const u8, app_secret: []const u8) bool {
-    // Reject empty secrets — misconfiguration guard
-    if (app_secret.len == 0) return false;
-
-    // Header must start with "sha256="
-    const prefix = "sha256=";
-    if (!std.mem.startsWith(u8, signature_header, prefix)) return false;
-
-    const provided_hex = signature_header[prefix.len..];
-
-    // HMAC-SHA256 digest is 32 bytes = 64 hex chars
-    if (provided_hex.len != 64) return false;
-
-    // Decode the provided hex string into bytes
-    const provided_bytes = hexDecode(provided_hex) orelse return false;
-
-    // Compute expected HMAC-SHA256
-    const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
-    var expected: [HmacSha256.mac_length]u8 = undefined;
-    HmacSha256.create(&expected, body, app_secret);
-
-    // Constant-time comparison — prevents timing side-channels
-    return constantTimeEql(&expected, &provided_bytes);
-}
-
-/// Decode a 64-char lowercase hex string into 32 bytes.
-/// Returns null if any character is not a valid hex digit.
-fn hexDecode(hex: []const u8) ?[32]u8 {
-    if (hex.len != 64) return null;
-    var out: [32]u8 = undefined;
-    for (0..32) |i| {
-        const hi = hexVal(hex[i * 2]) orelse return null;
-        const lo = hexVal(hex[i * 2 + 1]) orelse return null;
-        out[i] = (hi << 4) | lo;
-    }
-    return out;
-}
-
-/// Convert a single hex character to its 4-bit value.
-fn hexVal(c: u8) ?u8 {
-    if (c >= '0' and c <= '9') return c - '0';
-    if (c >= 'a' and c <= 'f') return c - 'a' + 10;
-    if (c >= 'A' and c <= 'F') return c - 'A' + 10;
-    return null;
-}
-
-/// Constant-time comparison of two 32-byte arrays.
-/// Always examines all bytes regardless of where a mismatch occurs.
-fn constantTimeEql(a: *const [32]u8, b: *const [32]u8) bool {
-    var diff: u8 = 0;
-    for (a, b) |ab, bb| {
-        diff |= ab ^ bb;
-    }
-    return diff == 0;
-}
-
 // ── JSON Helpers ────────────────────────────────────────────────
 
 /// Extract a string field from a JSON blob (minimal parser, no allocations).
@@ -571,48 +496,8 @@ pub fn processIncomingMessage(allocator: std.mem.Allocator, message: []const u8)
     return try allocator.dupe(u8, "No response from agent");
 }
 
-/// Send a reply to a Telegram chat using the Bot API.
-pub fn sendTelegramReply(allocator: std.mem.Allocator, bot_token: []const u8, chat_id: i64, text: []const u8) !void {
-    // Build the curl command to call the Telegram API
-    const url = try std.fmt.allocPrint(allocator, "https://api.telegram.org/bot{s}/sendMessage", .{bot_token});
-    defer allocator.free(url);
-
-    // JSON-escape the text for the body
-    var body_buf: std.ArrayList(u8) = .empty;
-    defer body_buf.deinit(allocator);
-    const w = body_buf.writer(allocator);
-    try w.print("{{\"chat_id\":{d},\"text\":\"", .{chat_id});
-    for (text) |c| {
-        switch (c) {
-            '"' => try w.writeAll("\\\""),
-            '\\' => try w.writeAll("\\\\"),
-            '\n' => try w.writeAll("\\n"),
-            '\r' => try w.writeAll("\\r"),
-            '\t' => try w.writeAll("\\t"),
-            else => try w.writeByte(c),
-        }
-    }
-    try w.writeAll("\"}");
-
-    const body = body_buf.items;
-
-    var curl_child = std.process.Child.init(
-        &[_][]const u8{
-            "curl", "-s",                             "-X", "POST",
-            "-H",   "Content-Type: application/json", "-d", body,
-            url,
-        },
-        allocator,
-    );
-    curl_child.stdout_behavior = .Pipe;
-    curl_child.stderr_behavior = .Pipe;
-
-    curl_child.spawn() catch return;
-    _ = curl_child.wait() catch {};
-}
-
 /// Run the HTTP gateway. Binds to host:port and serves HTTP requests.
-/// Endpoints: GET /health, GET /ready, POST /pair, POST /webhook, GET|POST /whatsapp, POST /telegram
+/// Endpoints: GET /health, GET /ready, POST /pair, POST /webhook
 pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16) !void {
     health.markComponentOk("gateway");
 
@@ -640,14 +525,6 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16) !void {
             cfg.gateway.require_pairing,
             cfg.gateway.paired_tokens,
         );
-        if (cfg.channels.telegram) |tg_cfg| {
-            state.telegram_bot_token = tg_cfg.bot_token;
-        }
-        if (cfg.channels.whatsapp) |wa_cfg| {
-            state.whatsapp_verify_token = wa_cfg.verify_token;
-            state.whatsapp_app_secret = wa_cfg.app_secret orelse "";
-        }
-
         // Build provider holder from configured provider name.
         holder_opt = providers.ProviderHolder.fromConfig(allocator, cfg.default_provider, cfg.defaultProviderKey(), cfg.getProviderBaseUrl(cfg.default_provider));
 
@@ -729,14 +606,12 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16) !void {
         const target = parts.next() orelse continue;
 
         // Simple routing — extract base path (strip query string) and look up route
-        const Route = enum { health, ready, webhook, pair, telegram, whatsapp };
+        const Route = enum { health, ready, webhook, pair };
         const route_map = std.StaticStringMap(Route).initComptime(.{
             .{ "/health", .health },
             .{ "/ready", .ready },
             .{ "/webhook", .webhook },
             .{ "/pair", .pair },
-            .{ "/telegram", .telegram },
-            .{ "/whatsapp", .whatsapp },
         });
         const base_path = if (std.mem.indexOfScalar(u8, target, '?')) |qi| target[0..qi] else target;
         const is_post = std.mem.eql(u8, method_str, "POST");
@@ -854,136 +729,6 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16) !void {
                         response_status = "500 Internal Server Error";
                         response_body = "{\"error\":\"pairing unavailable\"}";
                     }
-                }
-            },
-            .telegram => {
-                if (!is_post) {
-                    response_status = "405 Method Not Allowed";
-                    response_body = "{\"error\":\"method not allowed\"}";
-                } else if (!state.rate_limiter.allowWebhook(state.allocator, "telegram")) {
-                    // POST /telegram — Telegram webhook mode
-                    response_status = "429 Too Many Requests";
-                    response_body = "{\"error\":\"rate limited\"}";
-                } else {
-                    const body = extractBody(raw);
-                    if (body) |b| {
-                        // Parse Telegram update: extract message text and chat_id
-                        const msg_text = jsonStringField(b, "text");
-                        const chat_id = jsonIntField(b, "chat_id");
-
-                        if (msg_text != null and chat_id != null) {
-                            // Process the message in-process
-                            if (session_mgr_opt) |*sm| {
-                                var kb: [64]u8 = undefined;
-                                const sk = std.fmt.bufPrint(&kb, "telegram:{d}", .{chat_id.?}) catch "telegram:0";
-                                const reply = sm.processMessage(sk, msg_text.?) catch null;
-                                if (reply) |r| {
-                                    defer allocator.free(r);
-                                    // Send reply back to Telegram
-                                    if (state.telegram_bot_token.len > 0) {
-                                        sendTelegramReply(req_allocator, state.telegram_bot_token, chat_id.?, r) catch {};
-                                    }
-                                    response_body = "{\"status\":\"ok\"}";
-                                } else {
-                                    response_body = "{\"status\":\"received\"}";
-                                }
-                            } else {
-                                response_body = "{\"status\":\"received\"}";
-                            }
-                        } else {
-                            // No message text — could be an update_id-only update, just ack
-                            response_body = "{\"status\":\"ok\"}";
-                        }
-                    } else {
-                        response_body = "{\"status\":\"received\"}";
-                    }
-                }
-            },
-            .whatsapp => {
-                const is_get = std.mem.eql(u8, method_str, "GET");
-                if (is_get) {
-                    // GET /whatsapp — Meta webhook verification
-                    const mode = parseQueryParam(target, "hub.mode");
-                    const token = parseQueryParam(target, "hub.verify_token");
-                    const challenge = parseQueryParam(target, "hub.challenge");
-
-                    if (mode != null and challenge != null and token != null and
-                        std.mem.eql(u8, mode.?, "subscribe") and
-                        state.whatsapp_verify_token.len > 0 and
-                        std.mem.eql(u8, token.?, state.whatsapp_verify_token))
-                    {
-                        response_body = challenge.?;
-                    } else {
-                        response_status = "403 Forbidden";
-                        response_body = "{\"error\":\"verification failed\"}";
-                    }
-                } else if (is_post) {
-                    // POST /whatsapp — incoming message from Meta
-                    if (!state.rate_limiter.allowWebhook(state.allocator, "whatsapp")) {
-                        response_status = "429 Too Many Requests";
-                        response_body = "{\"error\":\"rate limited\"}";
-                    } else if (state.whatsapp_app_secret.len > 0) sig_check: {
-                        // HMAC-SHA256 signature verification (when app_secret is configured)
-                        const sig_header = extractHeader(raw, "X-Hub-Signature-256") orelse {
-                            response_status = "403 Forbidden";
-                            response_body = "{\"error\":\"missing signature\"}";
-                            break :sig_check;
-                        };
-                        const body_for_sig = extractBody(raw) orelse "";
-                        if (!verifyWhatsappSignature(body_for_sig, sig_header, state.whatsapp_app_secret)) {
-                            response_status = "403 Forbidden";
-                            response_body = "{\"error\":\"invalid signature\"}";
-                            break :sig_check;
-                        }
-                        // Signature valid — proceed with message processing
-                        const body = if (body_for_sig.len > 0) body_for_sig else null;
-                        if (body) |b| {
-                            const msg_text = jsonStringField(b, "text") orelse jsonStringField(b, "body");
-                            if (msg_text) |mt| {
-                                if (session_mgr_opt) |*sm| {
-                                    const reply = sm.processMessage("whatsapp", mt) catch null;
-                                    if (reply) |r| {
-                                        defer allocator.free(r);
-                                        response_body = req_allocator.dupe(u8, r) catch "{\"status\":\"received\"}";
-                                    } else {
-                                        response_body = "{\"status\":\"received\"}";
-                                    }
-                                } else {
-                                    response_body = "{\"status\":\"received\"}";
-                                }
-                            } else {
-                                response_body = "{\"status\":\"received\"}";
-                            }
-                        } else {
-                            response_body = "{\"status\":\"received\"}";
-                        }
-                    } else {
-                        const body = extractBody(raw);
-                        if (body) |b| {
-                            // Try to extract message text from WhatsApp payload
-                            const msg_text = jsonStringField(b, "text") orelse jsonStringField(b, "body");
-                            if (msg_text) |mt| {
-                                if (session_mgr_opt) |*sm| {
-                                    const reply = sm.processMessage("whatsapp", mt) catch null;
-                                    if (reply) |r| {
-                                        defer allocator.free(r);
-                                        response_body = req_allocator.dupe(u8, r) catch "{\"status\":\"received\"}";
-                                    } else {
-                                        response_body = "{\"status\":\"received\"}";
-                                    }
-                                } else {
-                                    response_body = "{\"status\":\"received\"}";
-                                }
-                            } else {
-                                response_body = "{\"status\":\"received\"}";
-                            }
-                        } else {
-                            response_body = "{\"status\":\"received\"}";
-                        }
-                    }
-                } else {
-                    response_status = "405 Method Not Allowed";
-                    response_body = "{\"error\":\"method not allowed\"}";
                 }
             },
         } else {
@@ -1176,28 +921,28 @@ test "rate limiter different keys do not interfere" {
     try std.testing.expect(limiter.allow(std.testing.allocator, "key-b"));
 }
 
-// ── WhatsApp / parseQueryParam tests ────────────────────────────
+// ── parseQueryParam tests ───────────────────────────────────────
 
 test "parseQueryParam extracts single param" {
-    const val = parseQueryParam("/whatsapp?hub.mode=subscribe", "hub.mode");
+    const val = parseQueryParam("/webhook?key=value", "key");
     try std.testing.expect(val != null);
-    try std.testing.expectEqualStrings("subscribe", val.?);
+    try std.testing.expectEqualStrings("value", val.?);
 }
 
 test "parseQueryParam extracts param from multiple" {
-    const target = "/whatsapp?hub.mode=subscribe&hub.verify_token=mytoken&hub.challenge=abc123";
-    try std.testing.expectEqualStrings("subscribe", parseQueryParam(target, "hub.mode").?);
-    try std.testing.expectEqualStrings("mytoken", parseQueryParam(target, "hub.verify_token").?);
-    try std.testing.expectEqualStrings("abc123", parseQueryParam(target, "hub.challenge").?);
+    const target = "/webhook?mode=subscribe&verify_token=mytoken&challenge=abc123";
+    try std.testing.expectEqualStrings("subscribe", parseQueryParam(target, "mode").?);
+    try std.testing.expectEqualStrings("mytoken", parseQueryParam(target, "verify_token").?);
+    try std.testing.expectEqualStrings("abc123", parseQueryParam(target, "challenge").?);
 }
 
 test "parseQueryParam returns null for missing param" {
-    const val = parseQueryParam("/whatsapp?hub.mode=subscribe", "hub.challenge");
+    const val = parseQueryParam("/webhook?mode=subscribe", "challenge");
     try std.testing.expect(val == null);
 }
 
 test "parseQueryParam returns null for no query string" {
-    const val = parseQueryParam("/whatsapp", "hub.mode");
+    const val = parseQueryParam("/webhook", "mode");
     try std.testing.expect(val == null);
 }
 
@@ -1212,16 +957,10 @@ test "parseQueryParam partial key match does not match" {
     try std.testing.expect(val == null);
 }
 
-test "GatewayState initWithVerifyToken stores token" {
-    var state = GatewayState.initWithVerifyToken(std.testing.allocator, "test-verify-token");
-    defer state.deinit();
-    try std.testing.expectEqualStrings("test-verify-token", state.whatsapp_verify_token);
-}
-
-test "GatewayState init has empty verify token" {
+test "GatewayState init defaults" {
     var state = GatewayState.init(std.testing.allocator);
     defer state.deinit();
-    try std.testing.expectEqualStrings("", state.whatsapp_verify_token);
+    try std.testing.expect(state.pairing_guard == null);
 }
 
 // ── Bearer Token Validation tests ───────────────────────────────
@@ -1396,12 +1135,6 @@ test "extractBody returns null for no separator" {
     try std.testing.expect(extractBody(raw) == null);
 }
 
-test "GatewayState init has empty telegram_bot_token" {
-    var state = GatewayState.init(std.testing.allocator);
-    defer state.deinit();
-    try std.testing.expectEqualStrings("", state.telegram_bot_token);
-}
-
 // ── asciiEqlIgnoreCase tests ─────────────────────────────────────
 
 test "asciiEqlIgnoreCase equal strings" {
@@ -1417,149 +1150,6 @@ test "asciiEqlIgnoreCase different strings" {
 
 test "asciiEqlIgnoreCase empty strings" {
     try std.testing.expect(asciiEqlIgnoreCase("", ""));
-}
-
-// ── WhatsApp HMAC-SHA256 Signature Verification tests ───────────
-
-test "verifyWhatsappSignature valid signature" {
-    // Compute a real HMAC-SHA256 and verify it passes
-    const body = "{\"entry\":[{\"changes\":[{\"value\":{\"messages\":[{\"text\":{\"body\":\"hello\"}}]}}]}]}";
-    const secret = "my_app_secret";
-    const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
-    var mac: [HmacSha256.mac_length]u8 = undefined;
-    HmacSha256.create(&mac, body, secret);
-    // Format as hex
-    var hex_buf: [64]u8 = undefined;
-    for (0..32) |i| {
-        const byte = mac[i];
-        hex_buf[i * 2] = "0123456789abcdef"[byte >> 4];
-        hex_buf[i * 2 + 1] = "0123456789abcdef"[byte & 0x0f];
-    }
-    var header_buf: [71]u8 = undefined; // "sha256=" (7) + 64 hex chars
-    @memcpy(header_buf[0..7], "sha256=");
-    @memcpy(header_buf[7..71], &hex_buf);
-    try std.testing.expect(verifyWhatsappSignature(body, &header_buf, secret));
-}
-
-test "verifyWhatsappSignature invalid signature rejected" {
-    const body = "{\"message\":\"test\"}";
-    const secret = "correct_secret";
-    // Provide a well-formed but wrong signature (all zeros)
-    const bad_sig = "sha256=0000000000000000000000000000000000000000000000000000000000000000";
-    try std.testing.expect(!verifyWhatsappSignature(body, bad_sig, secret));
-}
-
-test "verifyWhatsappSignature missing sha256= prefix rejected" {
-    const body = "test body";
-    const secret = "secret";
-    const no_prefix = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
-    try std.testing.expect(!verifyWhatsappSignature(body, no_prefix, secret));
-}
-
-test "verifyWhatsappSignature empty body with valid signature" {
-    const body = "";
-    const secret = "empty_body_secret";
-    const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
-    var mac: [HmacSha256.mac_length]u8 = undefined;
-    HmacSha256.create(&mac, body, secret);
-    var hex_buf: [64]u8 = undefined;
-    for (0..32) |i| {
-        const byte = mac[i];
-        hex_buf[i * 2] = "0123456789abcdef"[byte >> 4];
-        hex_buf[i * 2 + 1] = "0123456789abcdef"[byte & 0x0f];
-    }
-    var header_buf: [71]u8 = undefined;
-    @memcpy(header_buf[0..7], "sha256=");
-    @memcpy(header_buf[7..71], &hex_buf);
-    try std.testing.expect(verifyWhatsappSignature(body, &header_buf, secret));
-}
-
-test "verifyWhatsappSignature empty secret returns false" {
-    const body = "any body";
-    const sig = "sha256=0000000000000000000000000000000000000000000000000000000000000000";
-    try std.testing.expect(!verifyWhatsappSignature(body, sig, ""));
-}
-
-test "verifyWhatsappSignature wrong secret rejected" {
-    const body = "{\"data\":\"payload\"}";
-    const correct_secret = "real_secret";
-    const wrong_secret = "wrong_secret";
-    // Compute signature with correct secret
-    const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
-    var mac: [HmacSha256.mac_length]u8 = undefined;
-    HmacSha256.create(&mac, body, correct_secret);
-    var hex_buf: [64]u8 = undefined;
-    for (0..32) |i| {
-        const byte = mac[i];
-        hex_buf[i * 2] = "0123456789abcdef"[byte >> 4];
-        hex_buf[i * 2 + 1] = "0123456789abcdef"[byte & 0x0f];
-    }
-    var header_buf: [71]u8 = undefined;
-    @memcpy(header_buf[0..7], "sha256=");
-    @memcpy(header_buf[7..71], &hex_buf);
-    // Verify with wrong secret — should fail
-    try std.testing.expect(!verifyWhatsappSignature(body, &header_buf, wrong_secret));
-}
-
-test "verifyWhatsappSignature constant-time comparison basic check" {
-    // Verify that two identical MACs pass and two differing-by-one-bit MACs fail.
-    // This doesn't prove constant-time, but ensures the comparison logic is correct.
-    const body = "timing test body";
-    const secret = "timing_secret";
-    const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
-    var mac: [HmacSha256.mac_length]u8 = undefined;
-    HmacSha256.create(&mac, body, secret);
-
-    // constantTimeEql with itself
-    try std.testing.expect(constantTimeEql(&mac, &mac));
-
-    // Flip one bit in the last byte
-    var altered = mac;
-    altered[31] ^= 0x01;
-    try std.testing.expect(!constantTimeEql(&mac, &altered));
-
-    // Flip one bit in the first byte
-    var altered2 = mac;
-    altered2[0] ^= 0x80;
-    try std.testing.expect(!constantTimeEql(&mac, &altered2));
-}
-
-test "verifyWhatsappSignature hex encoding edge cases" {
-    // Truncated hex (too short)
-    try std.testing.expect(!verifyWhatsappSignature("body", "sha256=abcdef", "secret"));
-    // Too long hex
-    try std.testing.expect(!verifyWhatsappSignature("body", "sha256=00000000000000000000000000000000000000000000000000000000000000001", "secret"));
-    // Invalid hex characters
-    try std.testing.expect(!verifyWhatsappSignature("body", "sha256=zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz", "secret"));
-    // Empty signature header
-    try std.testing.expect(!verifyWhatsappSignature("body", "", "secret"));
-    // Just the prefix, no hex
-    try std.testing.expect(!verifyWhatsappSignature("body", "sha256=", "secret"));
-}
-
-test "verifyWhatsappSignature uppercase hex accepted" {
-    // Meta typically sends lowercase, but we accept uppercase too
-    const body = "uppercase hex test";
-    const secret = "hex_secret";
-    const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
-    var mac: [HmacSha256.mac_length]u8 = undefined;
-    HmacSha256.create(&mac, body, secret);
-    var hex_buf: [64]u8 = undefined;
-    for (0..32) |i| {
-        const byte = mac[i];
-        hex_buf[i * 2] = "0123456789ABCDEF"[byte >> 4];
-        hex_buf[i * 2 + 1] = "0123456789ABCDEF"[byte & 0x0f];
-    }
-    var header_buf: [71]u8 = undefined;
-    @memcpy(header_buf[0..7], "sha256=");
-    @memcpy(header_buf[7..71], &hex_buf);
-    try std.testing.expect(verifyWhatsappSignature(body, &header_buf, secret));
-}
-
-test "GatewayState init has empty whatsapp_app_secret" {
-    var state = GatewayState.init(std.testing.allocator);
-    defer state.deinit();
-    try std.testing.expectEqualStrings("", state.whatsapp_app_secret);
 }
 
 // ── /ready endpoint tests ────────────────────────────────────────────

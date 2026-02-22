@@ -142,15 +142,6 @@ pub const CronConfig = struct {
 
 // ── Channel configs ─────────────────────────────────────────────
 
-pub const TelegramConfig = struct {
-    bot_token: []const u8,
-    allow_from: []const []const u8 = &.{},
-    /// Use reply-to in private (1:1) chats. Groups always use reply-to.
-    reply_in_private: bool = true,
-    /// Optional SOCKS5/HTTP proxy URL for all Telegram API requests (e.g. "socks5://host:port").
-    proxy: ?[]const u8 = null,
-};
-
 pub const DiscordConfig = struct {
     token: []const u8,
     guild_id: ?[]const u8 = null,
@@ -174,73 +165,11 @@ pub const WebhookConfig = struct {
     secret: ?[]const u8 = null,
 };
 
-pub const IMessageConfig = struct {
-    allow_from: []const []const u8 = &.{},
-    enabled: bool = false,
-};
-
-pub const MatrixConfig = struct {
-    homeserver: []const u8,
-    access_token: []const u8,
-    room_id: []const u8,
-    allow_from: []const []const u8 = &.{},
-};
-
-pub const WhatsAppConfig = struct {
-    access_token: []const u8,
-    phone_number_id: []const u8,
-    verify_token: []const u8,
-    app_secret: ?[]const u8 = null,
-    allow_from: []const []const u8 = &.{},
-};
-
-pub const IrcConfig = struct {
-    host: []const u8,
-    port: u16 = 6697,
-    nick: []const u8,
-    username: ?[]const u8 = null,
-    channels: []const []const u8 = &.{},
-    allow_from: []const []const u8 = &.{},
-    server_password: ?[]const u8 = null,
-    nickserv_password: ?[]const u8 = null,
-    sasl_password: ?[]const u8 = null,
-    tls: bool = true,
-};
-
-pub const LarkReceiveMode = enum {
-    websocket,
-    webhook,
-};
-
-pub const LarkConfig = struct {
-    app_id: []const u8,
-    app_secret: []const u8,
-    encrypt_key: ?[]const u8 = null,
-    verification_token: ?[]const u8 = null,
-    use_feishu: bool = false,
-    allow_from: []const []const u8 = &.{},
-    receive_mode: LarkReceiveMode = .websocket,
-    port: ?u16 = null,
-};
-
-pub const DingTalkConfig = struct {
-    client_id: []const u8,
-    client_secret: []const u8,
-    allow_from: []const []const u8 = &.{},
-};
-
 pub const ChannelsConfig = struct {
     cli: bool = true,
-    telegram: ?TelegramConfig = null,
     discord: ?DiscordConfig = null,
     slack: ?SlackConfig = null,
     webhook: ?WebhookConfig = null,
-    imessage: ?IMessageConfig = null,
-    matrix: ?MatrixConfig = null,
-    whatsapp: ?WhatsAppConfig = null,
-    irc: ?IrcConfig = null,
-    lark: ?LarkConfig = null,
-    dingtalk: ?DingTalkConfig = null,
 };
 
 // ── Memory config ───────────────────────────────────────────────
@@ -428,7 +357,7 @@ pub const SecurityConfig = struct {
     sandbox: SandboxConfig = .{},
     resources: ResourceLimitsConfig = .{},
     audit: AuditConfig = .{},
-    /// Discord/Telegram user ID of the bot owner. Only this user can use privileged tools.
+    /// Discord user ID of the bot owner. Only this user can use privileged tools.
     owner_id: []const u8 = "",
     /// Per-workspace approval policy overrides. Empty = use global defaults.
     workspace_policies: []const WorkspaceApprovalPolicyConfig = &.{},

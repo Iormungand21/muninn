@@ -14,7 +14,6 @@ const cron = @import("cron.zig");
 const bus_mod = @import("bus.zig");
 const dispatch = @import("channels/dispatch.zig");
 const channel_loop = @import("channel_loop.zig");
-const telegram = @import("channels/telegram.zig");
 
 const log = std.log.scoped(.daemon);
 
@@ -118,12 +117,8 @@ pub fn computeBackoff(current_backoff: u64, max_backoff: u64) u64 {
 
 /// Check if any real-time channels are configured.
 pub fn hasSupervisedChannels(config: *const Config) bool {
-    return config.channels.telegram != null or
-        config.channels.discord != null or
-        config.channels.slack != null or
-        config.channels.imessage != null or
-        config.channels.matrix != null or
-        config.channels.whatsapp != null;
+    return config.channels.discord != null or
+        config.channels.slack != null;
 }
 
 /// Shutdown signal — set to true to stop the daemon.
@@ -202,155 +197,23 @@ fn schedulerThread(allocator: std.mem.Allocator, config: *const Config, state: *
     }
 }
 
-/// Stale detection threshold: 3x the Telegram long-poll timeout (30s).
-const STALE_THRESHOLD_SECS: i64 = 90;
-
-/// Channel supervisor thread — spawns polling threads for configured channels,
-/// monitors their health, and restarts on failure using SupervisedChannel.
+/// Channel supervisor thread — monitors configured channels' health.
 fn channelSupervisorThread(
-    allocator: std.mem.Allocator,
-    config: *const Config,
+    _: std.mem.Allocator,
+    _: *const Config,
     state: *DaemonState,
-    channel_registry: *dispatch.ChannelRegistry,
-    channel_rt: ?*channel_loop.ChannelRuntime,
+    _: *dispatch.ChannelRegistry,
+    _: ?*channel_loop.ChannelRuntime,
 ) void {
     state.markRunning("channels");
     health.markComponentOk("channels");
-
-    // ── Telegram supervision ──
-    var tg_loop_state: ?*channel_loop.TelegramLoopState = null;
-    var tg_health_channel: ?*telegram.TelegramChannel = null;
-    var supervised: ?dispatch.SupervisedChannel = null;
-
-    if (config.channels.telegram) |tg_config| {
-        if (channel_rt == null) {
-            state.markError("channels", "runtime init failed");
-            health.markComponentError("channels", "runtime init failed");
-        }
-        if (channel_rt) |rt| {
-            // Heap-alloc loop state
-            const ls = allocator.create(channel_loop.TelegramLoopState) catch {
-                state.markError("channels", "failed to alloc loop state");
-                health.markComponentError("channels", "alloc failed");
-                return;
-            };
-            ls.* = channel_loop.TelegramLoopState.init();
-            tg_loop_state = ls;
-
-            // Separate TelegramChannel for health-check probe (stateless HTTP GET)
-            const hc = allocator.create(telegram.TelegramChannel) catch {
-                state.markError("channels", "failed to alloc health channel");
-                return;
-            };
-            hc.* = telegram.TelegramChannel.init(allocator, tg_config.bot_token, tg_config.allow_from);
-            hc.proxy = tg_config.proxy;
-            tg_health_channel = hc;
-
-            // Register in channel registry for outbound dispatch
-            channel_registry.register(hc.channel()) catch |err| {
-                log.warn("Failed to register telegram in channel registry: {}", .{err});
-            };
-
-            // SupervisedChannel wrapper
-            supervised = dispatch.spawnSupervisedChannel(hc.channel(), 5);
-
-            // Spawn the polling thread
-            ls.thread = spawnTelegramThread(allocator, config, rt, ls);
-            if (ls.thread != null) {
-                if (supervised) |*s| s.recordSuccess();
-                log.info("Telegram polling thread started", .{});
-            }
-        }
-    }
-
-    defer {
-        // Shutdown: signal polling thread to stop and join
-        if (tg_loop_state) |ls| {
-            ls.stop_requested.store(true, .release);
-            if (ls.thread) |t| t.join();
-            allocator.destroy(ls);
-        }
-        if (tg_health_channel) |hc| allocator.destroy(hc);
-    }
 
     // ── Monitoring loop ──
     while (!isShutdownRequested()) {
         std.Thread.sleep(CHANNEL_WATCH_INTERVAL_SECS * std.time.ns_per_s);
         if (isShutdownRequested()) break;
-
-        if (tg_loop_state) |ls| {
-            const now = std.time.timestamp();
-            const last = ls.last_activity.load(.acquire);
-            const stale = (now - last) > STALE_THRESHOLD_SECS;
-
-            // Active HTTP health-check probe
-            const probe_ok = if (tg_health_channel) |hc| hc.healthCheck() else true;
-
-            if (!stale and probe_ok) {
-                health.markComponentOk("telegram");
-                state.markRunning("channels");
-                if (supervised) |*s| {
-                    if (s.state != .running) s.recordSuccess();
-                }
-            } else {
-                // Problem detected
-                const reason = if (stale) "polling thread stale" else "health check failed";
-                log.warn("Telegram issue: {s}", .{reason});
-                health.markComponentError("telegram", reason);
-
-                if (supervised) |*s| {
-                    s.recordFailure();
-
-                    if (s.shouldRestart()) {
-                        log.info("Restarting Telegram polling (attempt {d})", .{s.restart_count});
-                        state.markError("channels", reason);
-
-                        // Stop old thread
-                        ls.stop_requested.store(true, .release);
-                        if (ls.thread) |t| t.join();
-
-                        // Backoff sleep
-                        std.Thread.sleep(s.currentBackoffMs() * std.time.ns_per_ms);
-
-                        // Respawn
-                        ls.stop_requested.store(false, .release);
-                        ls.last_activity.store(std.time.timestamp(), .release);
-                        if (channel_rt) |rt| {
-                            ls.thread = spawnTelegramThread(allocator, config, rt, ls);
-                            if (ls.thread != null) {
-                                s.recordSuccess();
-                                state.markRunning("channels");
-                                health.markComponentOk("telegram");
-                            }
-                        }
-                    } else if (s.state == .gave_up) {
-                        state.markError("channels", "gave up after max restarts");
-                        health.markComponentError("telegram", "gave up after max restarts");
-                    }
-                }
-            }
-        } else {
-            // No telegram configured — just report ok
-            health.markComponentOk("channels");
-        }
+        health.markComponentOk("channels");
     }
-}
-
-/// Spawn a Telegram polling thread.
-fn spawnTelegramThread(
-    allocator: std.mem.Allocator,
-    config: *const Config,
-    runtime: *channel_loop.ChannelRuntime,
-    loop_state: *channel_loop.TelegramLoopState,
-) ?std.Thread {
-    return std.Thread.spawn(
-        .{ .stack_size = 512 * 1024 },
-        channel_loop.runTelegramLoop,
-        .{ allocator, config, runtime, loop_state },
-    ) catch |err| {
-        log.err("Failed to spawn Telegram thread: {}", .{err});
-        return null;
-    };
 }
 
 /// Run the daemon. This is the main entry point for `nullclaw daemon`.
@@ -583,7 +446,7 @@ test "channelSupervisorThread respects shutdown" {
     shutdown_requested.store(true, .release);
     defer shutdown_requested.store(false, .release);
 
-    // Config with no telegram → supervisor goes straight to idle loop → exits on shutdown
+    // Config with no channels → supervisor goes straight to idle loop → exits on shutdown
     const config = Config{
         .workspace_dir = "/tmp",
         .config_path = "/tmp/config.json",

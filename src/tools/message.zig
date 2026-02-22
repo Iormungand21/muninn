@@ -25,7 +25,7 @@ pub const MessageTool = struct {
     pub const tool_name = "message";
     pub const tool_description = "Send a message to a channel. If channel/chat_id are omitted, sends to the current conversation.";
     pub const tool_params =
-        \\{"type":"object","properties":{"content":{"type":"string","minLength":1,"description":"Message text to send"},"channel":{"type":"string","description":"Target channel (telegram, discord, slack, etc.). Defaults to current."},"chat_id":{"type":"string","description":"Target chat/room ID. Defaults to current."}},"required":["content"]}
+        \\{"type":"object","properties":{"content":{"type":"string","minLength":1,"description":"Message text to send"},"channel":{"type":"string","description":"Target channel (discord, slack, etc.). Defaults to current."},"chat_id":{"type":"string","description":"Target chat/room ID. Defaults to current."}},"required":["content"]}
     ;
 
     const vtable = root.ToolVTable(@This());
@@ -137,14 +137,14 @@ test "MessageTool execute without channel uses default" {
     defer event_bus.close();
     var mt = MessageTool{
         .event_bus = &event_bus,
-        .default_channel = "telegram",
+        .default_channel = "discord",
         .default_chat_id = "chat42",
     };
     const parsed = try root.parseTestArgs("{\"content\":\"hello\"}");
     defer parsed.deinit();
     const result = try mt.execute(testing.allocator, parsed.value.object);
     try testing.expect(result.success);
-    try testing.expect(std.mem.indexOf(u8, result.output, "telegram") != null);
+    try testing.expect(std.mem.indexOf(u8, result.output, "discord") != null);
     // Free the allocated output
     testing.allocator.free(result.output);
 
@@ -158,7 +158,7 @@ test "MessageTool execute with explicit channel overrides default" {
     defer event_bus.close();
     var mt = MessageTool{
         .event_bus = &event_bus,
-        .default_channel = "telegram",
+        .default_channel = "discord",
         .default_chat_id = "chat42",
     };
     const parsed = try root.parseTestArgs("{\"content\":\"hi\",\"channel\":\"discord\",\"chat_id\":\"room1\"}");
@@ -179,8 +179,8 @@ test "MessageTool setContext and hasMessageBeenSent" {
     var mt = MessageTool{};
     try testing.expect(!mt.hasMessageBeenSent());
 
-    mt.setContext("telegram", "c1");
-    try testing.expectEqualStrings("telegram", mt.default_channel.?);
+    mt.setContext("discord", "c1");
+    try testing.expectEqualStrings("discord", mt.default_channel.?);
     try testing.expectEqualStrings("c1", mt.default_chat_id.?);
     try testing.expect(!mt.hasMessageBeenSent());
 }
