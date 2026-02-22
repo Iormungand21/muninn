@@ -83,6 +83,11 @@ pub const i2c = @import("i2c.zig");
 pub const spi = @import("spi.zig");
 pub const path_security = @import("path_security.zig");
 pub const process_util = @import("process_util.zig");
+pub const reliability = @import("reliability.zig");
+
+// TODO(S1-TOOL-001): Incrementally adopt reliability.reliableExecute in
+// tools that benefit from retries/circuit-breaking (e.g. http_request,
+// shell, delegate). Each tool can attach a ToolPolicy + ToolHealth.
 
 // ── Core types ──────────────────────────────────────────────────────
 
