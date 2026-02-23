@@ -393,6 +393,30 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             if (tl.object.get("web_fetch_max_chars")) |v| {
                 if (v == .integer) self.tools.web_fetch_max_chars = @intCast(v.integer);
             }
+            // tools.timeouts → self.tools.timeouts
+            if (tl.object.get("timeouts")) |to| {
+                if (to == .object) {
+                    if (to.object.get("shell_ms")) |v| {
+                        if (v == .integer) self.tools.timeouts.shell_ms = @intCast(v.integer);
+                    }
+                    // Accept both "shell" (shorthand in ms) and "shell_ms"
+                    if (to.object.get("shell")) |v| {
+                        if (v == .integer) self.tools.timeouts.shell_ms = @intCast(v.integer);
+                    }
+                    if (to.object.get("http_request_ms")) |v| {
+                        if (v == .integer) self.tools.timeouts.http_request_ms = @intCast(v.integer);
+                    }
+                    if (to.object.get("http_request")) |v| {
+                        if (v == .integer) self.tools.timeouts.http_request_ms = @intCast(v.integer);
+                    }
+                    if (to.object.get("default_ms")) |v| {
+                        if (v == .integer) self.tools.timeouts.default_ms = @intCast(v.integer);
+                    }
+                    if (to.object.get("default")) |v| {
+                        if (v == .integer) self.tools.timeouts.default_ms = @intCast(v.integer);
+                    }
+                }
+            }
             // tools.media.audio → self.audio_media
             if (tl.object.get("media")) |media| {
                 if (media == .object) {

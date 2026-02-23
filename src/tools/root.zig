@@ -430,6 +430,88 @@ pub fn subagentTools(
     return list.toOwnedSlice(allocator);
 }
 
+// ── Tool usage analytics ────────────────────────────────────────────
+
+/// Per-tool usage statistics.
+pub const ToolStats = struct {
+    invocations: u64 = 0,
+    successes: u64 = 0,
+    failures: u64 = 0,
+    total_latency_ms: u64 = 0,
+};
+
+/// Fixed-capacity entry for per-tool stats tracking.
+pub const ToolStatsEntry = struct {
+    name: [64]u8 = [_]u8{0} ** 64,
+    name_len: usize = 0,
+    stats: ToolStats = .{},
+};
+
+/// Maximum number of distinct tools tracked.
+pub const MAX_TRACKED_TOOLS: usize = 32;
+
+/// Allocation-free tool usage analytics tracker.
+/// Tracks per-tool and aggregate invocation counts, success/failure rates, and latency.
+pub const ToolStatsTracker = struct {
+    entries: [MAX_TRACKED_TOOLS]ToolStatsEntry = [_]ToolStatsEntry{.{}} ** MAX_TRACKED_TOOLS,
+    count: usize = 0,
+    total: ToolStats = .{},
+
+    /// Record a tool invocation result.
+    pub fn record(self: *ToolStatsTracker, name: []const u8, success: bool, latency_ms: u64) void {
+        // Update aggregate totals
+        self.total.invocations += 1;
+        if (success) self.total.successes += 1 else self.total.failures += 1;
+        self.total.total_latency_ms += latency_ms;
+
+        // Find existing entry
+        for (self.entries[0..self.count]) |*entry| {
+            if (entry.name_len == name.len and std.mem.eql(u8, entry.name[0..entry.name_len], name)) {
+                entry.stats.invocations += 1;
+                if (success) entry.stats.successes += 1 else entry.stats.failures += 1;
+                entry.stats.total_latency_ms += latency_ms;
+                return;
+            }
+        }
+
+        // New tool — add entry if capacity remains
+        if (self.count < MAX_TRACKED_TOOLS) {
+            const len = @min(name.len, 64);
+            @memcpy(self.entries[self.count].name[0..len], name[0..len]);
+            self.entries[self.count].name_len = len;
+            self.entries[self.count].stats = .{
+                .invocations = 1,
+                .successes = if (success) 1 else 0,
+                .failures = if (!success) 1 else 0,
+                .total_latency_ms = latency_ms,
+            };
+            self.count += 1;
+        }
+    }
+
+    /// Return aggregate stats across all tools.
+    pub fn getTotal(self: *const ToolStatsTracker) ToolStats {
+        return self.total;
+    }
+
+    /// Look up stats for a specific tool by name.
+    pub fn getToolStats(self: *const ToolStatsTracker, name: []const u8) ?ToolStats {
+        for (self.entries[0..self.count]) |*entry| {
+            if (entry.name_len == name.len and std.mem.eql(u8, entry.name[0..entry.name_len], name)) {
+                return entry.stats;
+            }
+        }
+        return null;
+    }
+
+    /// Reset all tracked stats.
+    pub fn reset(self: *ToolStatsTracker) void {
+        self.count = 0;
+        self.total = .{};
+        self.entries = [_]ToolStatsEntry{.{}} ** MAX_TRACKED_TOOLS;
+    }
+};
+
 // ── Tests ───────────────────────────────────────────────────────────
 
 test "getString returns unescaped newlines and tabs" {
@@ -625,6 +707,102 @@ test "all tools excludes extras when disabled" {
     // shell + file_read + file_write + file_edit + git + image_info
     // + memory_store + memory_recall + memory_forget + delegate + schedule + spawn = 12
     try std.testing.expectEqual(@as(usize, 12), tools.len);
+}
+
+// ── ToolStatsTracker tests ──────────────────────────────────────────
+
+test "ToolStatsTracker record single tool" {
+    var tracker = ToolStatsTracker{};
+    tracker.record("shell", true, 100);
+
+    try std.testing.expectEqual(@as(u64, 1), tracker.total.invocations);
+    try std.testing.expectEqual(@as(u64, 1), tracker.total.successes);
+    try std.testing.expectEqual(@as(u64, 0), tracker.total.failures);
+    try std.testing.expectEqual(@as(u64, 100), tracker.total.total_latency_ms);
+    try std.testing.expectEqual(@as(usize, 1), tracker.count);
+
+    const shell_stats = tracker.getToolStats("shell").?;
+    try std.testing.expectEqual(@as(u64, 1), shell_stats.invocations);
+    try std.testing.expectEqual(@as(u64, 1), shell_stats.successes);
+}
+
+test "ToolStatsTracker record multiple tools" {
+    var tracker = ToolStatsTracker{};
+    tracker.record("shell", true, 50);
+    tracker.record("file_read", true, 10);
+    tracker.record("shell", false, 200);
+
+    try std.testing.expectEqual(@as(u64, 3), tracker.total.invocations);
+    try std.testing.expectEqual(@as(u64, 2), tracker.total.successes);
+    try std.testing.expectEqual(@as(u64, 1), tracker.total.failures);
+    try std.testing.expectEqual(@as(u64, 260), tracker.total.total_latency_ms);
+    try std.testing.expectEqual(@as(usize, 2), tracker.count);
+
+    const shell_stats = tracker.getToolStats("shell").?;
+    try std.testing.expectEqual(@as(u64, 2), shell_stats.invocations);
+    try std.testing.expectEqual(@as(u64, 1), shell_stats.successes);
+    try std.testing.expectEqual(@as(u64, 1), shell_stats.failures);
+    try std.testing.expectEqual(@as(u64, 250), shell_stats.total_latency_ms);
+
+    const read_stats = tracker.getToolStats("file_read").?;
+    try std.testing.expectEqual(@as(u64, 1), read_stats.invocations);
+}
+
+test "ToolStatsTracker getToolStats returns null for unknown tool" {
+    var tracker = ToolStatsTracker{};
+    tracker.record("shell", true, 10);
+    try std.testing.expect(tracker.getToolStats("unknown") == null);
+}
+
+test "ToolStatsTracker reset clears all stats" {
+    var tracker = ToolStatsTracker{};
+    tracker.record("shell", true, 50);
+    tracker.record("file_read", false, 10);
+
+    try std.testing.expectEqual(@as(u64, 2), tracker.total.invocations);
+    try std.testing.expectEqual(@as(usize, 2), tracker.count);
+
+    tracker.reset();
+
+    try std.testing.expectEqual(@as(u64, 0), tracker.total.invocations);
+    try std.testing.expectEqual(@as(usize, 0), tracker.count);
+    try std.testing.expect(tracker.getToolStats("shell") == null);
+}
+
+test "ToolStatsTracker failures only" {
+    var tracker = ToolStatsTracker{};
+    tracker.record("http_request", false, 5000);
+    tracker.record("http_request", false, 3000);
+
+    try std.testing.expectEqual(@as(u64, 2), tracker.total.failures);
+    try std.testing.expectEqual(@as(u64, 0), tracker.total.successes);
+    try std.testing.expectEqual(@as(u64, 8000), tracker.total.total_latency_ms);
+}
+
+test "ToolStatsTracker capacity limit" {
+    var tracker = ToolStatsTracker{};
+    // Fill to capacity
+    var i: usize = 0;
+    while (i < MAX_TRACKED_TOOLS) : (i += 1) {
+        var name: [8]u8 = undefined;
+        const name_len = std.fmt.bufPrint(&name, "tool_{d}", .{i}) catch unreachable;
+        tracker.record(name_len, true, 10);
+    }
+    try std.testing.expectEqual(MAX_TRACKED_TOOLS, tracker.count);
+
+    // One more should not crash but won't add a new entry
+    tracker.record("overflow_tool", true, 10);
+    try std.testing.expectEqual(MAX_TRACKED_TOOLS, tracker.count);
+    // Total still incremented
+    try std.testing.expectEqual(@as(u64, MAX_TRACKED_TOOLS + 1), tracker.total.invocations);
+}
+
+test "ToolStats default values" {
+    const stats = ToolStats{};
+    try std.testing.expectEqual(@as(u64, 0), stats.invocations);
+    try std.testing.expectEqual(@as(u64, 0), stats.successes);
+    try std.testing.expectEqual(@as(u64, 0), stats.failures);
+    try std.testing.expectEqual(@as(u64, 0), stats.total_latency_ms);
 }
 
 test {

@@ -115,11 +115,25 @@ pub const AgentConfig = struct {
     message_timeout_secs: u64 = 300,
 };
 
+pub const ToolTimeouts = struct {
+    shell_ms: u64 = 120_000, // 120s
+    http_request_ms: u64 = 60_000, // 60s
+    default_ms: u64 = 30_000, // 30s
+
+    /// Return the timeout in milliseconds for a given tool name.
+    pub fn getTimeoutMs(self: ToolTimeouts, tool_name: []const u8) u64 {
+        if (std.mem.eql(u8, tool_name, "shell")) return self.shell_ms;
+        if (std.mem.eql(u8, tool_name, "http_request")) return self.http_request_ms;
+        return self.default_ms;
+    }
+};
+
 pub const ToolsConfig = struct {
     shell_timeout_secs: u64 = 60,
     shell_max_output_bytes: u32 = 1_048_576, // 1MB
     max_file_size_bytes: u32 = 10_485_760, // 10MB — shared file_read/edit/append
     web_fetch_max_chars: u32 = 50_000,
+    timeouts: ToolTimeouts = .{},
 };
 
 pub const ModelRouteConfig = struct {

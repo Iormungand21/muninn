@@ -83,6 +83,9 @@ pub const Agent = struct {
     /// Total tokens used across all turns.
     total_tokens: u64 = 0,
 
+    /// Per-tool usage analytics tracker.
+    tool_stats: tools_mod.ToolStatsTracker = .{},
+
     /// Whether the system prompt has been injected.
     has_system_prompt: bool = false,
 
@@ -211,14 +214,17 @@ pub const Agent = struct {
         }
 
         if (std.mem.eql(u8, trimmed, "/status")) {
+            const ts = self.tool_stats.getTotal();
             return try std.fmt.allocPrint(
                 self.allocator,
-                "Model: {s}\nHistory: {d} messages\nTokens used: {d}\nTools: {d} available",
+                "Model: {s}\nHistory: {d} messages\nTokens used: {d}\nTools: {d} available, {d} invocations, {d} failures",
                 .{
                     self.model_name,
                     self.history.items.len,
                     self.total_tokens,
                     self.tools.len,
+                    ts.invocations,
+                    ts.failures,
                 },
             );
         }
@@ -615,6 +621,9 @@ pub const Agent = struct {
                     .success = result.success,
                 } };
                 self.observer.recordEvent(&tool_event);
+
+                // Record tool usage analytics
+                self.tool_stats.record(call.name, result.success, tool_duration);
 
                 try results_buf.append(self.allocator, result);
             }
@@ -1471,6 +1480,8 @@ test "slash /status returns agent info" {
 
     try std.testing.expect(std.mem.indexOf(u8, response, "test-model") != null);
     try std.testing.expect(std.mem.indexOf(u8, response, "42") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "invocations") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "failures") != null);
 }
 
 test "slash /model switches model" {

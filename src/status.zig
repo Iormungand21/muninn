@@ -79,6 +79,13 @@ pub fn run(allocator: std.mem.Allocator) !void {
         if (cfg.security.audit.enabled) "enabled" else "disabled",
     });
 
+    // Tool timeouts
+    try w.print("Tools:       shell={d}ms, http={d}ms, default={d}ms\n", .{
+        cfg.tools.timeouts.shell_ms,
+        cfg.tools.timeouts.http_request_ms,
+        cfg.tools.timeouts.default_ms,
+    });
+
     try w.print("\n", .{});
 
     // Channels

@@ -44,6 +44,7 @@ pub const DelegateAgentConfig = config_types.DelegateAgentConfig;
 pub const NamedAgentConfig = config_types.NamedAgentConfig;
 pub const McpServerConfig = config_types.McpServerConfig;
 pub const ModelPricing = config_types.ModelPricing;
+pub const ToolTimeouts = config_types.ToolTimeouts;
 pub const ToolsConfig = config_types.ToolsConfig;
 pub const ProviderEntry = config_types.ProviderEntry;
 pub const AudioMediaConfig = config_types.AudioMediaConfig;
@@ -1368,6 +1369,45 @@ test "json parse reasoning_effort low" {
     try cfg.parseJson(json);
     try std.testing.expectEqualStrings("low", cfg.reasoning_effort.?);
     allocator.free(cfg.reasoning_effort.?);
+}
+
+test "json parse tools.timeouts section" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"tools": {"timeouts": {"shell": 90000, "http_request": 45000, "default": 15000}}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expectEqual(@as(u64, 90000), cfg.tools.timeouts.shell_ms);
+    try std.testing.expectEqual(@as(u64, 45000), cfg.tools.timeouts.http_request_ms);
+    try std.testing.expectEqual(@as(u64, 15000), cfg.tools.timeouts.default_ms);
+}
+
+test "json parse tools.timeouts with _ms suffix" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"tools": {"timeouts": {"shell_ms": 100000, "http_request_ms": 50000, "default_ms": 20000}}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expectEqual(@as(u64, 100000), cfg.tools.timeouts.shell_ms);
+    try std.testing.expectEqual(@as(u64, 50000), cfg.tools.timeouts.http_request_ms);
+    try std.testing.expectEqual(@as(u64, 20000), cfg.tools.timeouts.default_ms);
+}
+
+test "ToolTimeouts defaults" {
+    const t = ToolTimeouts{};
+    try std.testing.expectEqual(@as(u64, 120_000), t.shell_ms);
+    try std.testing.expectEqual(@as(u64, 60_000), t.http_request_ms);
+    try std.testing.expectEqual(@as(u64, 30_000), t.default_ms);
+}
+
+test "ToolTimeouts getTimeoutMs returns correct per-tool values" {
+    const t = ToolTimeouts{ .shell_ms = 90_000, .http_request_ms = 45_000, .default_ms = 15_000 };
+    try std.testing.expectEqual(@as(u64, 90_000), t.getTimeoutMs("shell"));
+    try std.testing.expectEqual(@as(u64, 45_000), t.getTimeoutMs("http_request"));
+    try std.testing.expectEqual(@as(u64, 15_000), t.getTimeoutMs("file_read"));
+    try std.testing.expectEqual(@as(u64, 15_000), t.getTimeoutMs("git"));
 }
 
 test "unknown openclaw fields silently ignored" {
