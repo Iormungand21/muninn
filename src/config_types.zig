@@ -423,7 +423,7 @@ pub const OfflineQueueConfig = struct {
     /// Path to the JSONL queue file.
     path: []const u8 = "offline_queue.jsonl",
     /// Maximum items the queue may hold (0 = unlimited).
-    max_items: u32 = 256,
+    max_items: u32 = 1000,
     /// Maximum delivery attempts per item before marking failed.
     max_attempts: u32 = 5,
     /// Drain interval in seconds (how often to attempt delivery of pending items).
