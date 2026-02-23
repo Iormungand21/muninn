@@ -29,6 +29,7 @@ const Command = enum {
     migrate,
     models,
     auth,
+    audit,
     help,
 };
 
@@ -51,6 +52,7 @@ fn parseCommand(arg: []const u8) ?Command {
         .{ "migrate", .migrate },
         .{ "models", .models },
         .{ "auth", .auth },
+        .{ "audit", .audit },
         .{ "help", .help },
         .{ "--help", .help },
         .{ "-h", .help },
@@ -106,6 +108,7 @@ pub fn main() !void {
         .migrate => try runMigrate(allocator, sub_args),
         .models => try runModels(allocator, sub_args),
         .auth => try runAuth(allocator, sub_args),
+        .audit => try runAudit(allocator, sub_args),
     }
 }
 
@@ -904,6 +907,118 @@ fn runDiscordChannelStart(allocator: std.mem.Allocator, args: []const []const u8
     }
 }
 
+// ── Audit ────────────────────────────────────────────────────
+
+fn runAudit(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
+    if (sub_args.len < 1) {
+        std.debug.print(
+            \\Usage: nullclaw audit <command> [options]
+            \\
+            \\Commands:
+            \\  search [options]              Search audit events
+            \\  tail [-n N]                   Show last N audit events (default 20)
+            \\  stats                         Show event counts by type and actor
+            \\
+            \\Search options:
+            \\  --actor <name>                Filter by actor (username, user_id, or channel)
+            \\  --action <pattern>            Filter by action command or event type
+            \\  --since <duration>            Filter events newer than duration (e.g. 7d, 24h, 30m)
+            \\
+            \\Examples:
+            \\  nullclaw audit search --actor alice --since 7d
+            \\  nullclaw audit search --action git
+            \\  nullclaw audit tail -n 50
+            \\  nullclaw audit stats
+            \\
+        , .{});
+        std.process.exit(1);
+    }
+
+    var cfg = yc.config.Config.load(allocator) catch {
+        std.debug.print("No config found -- run `nullclaw onboard` first\n", .{});
+        std.process.exit(1);
+    };
+    defer cfg.deinit();
+
+    // Resolve audit log path
+    const log_path = std.fs.path.join(allocator, &.{ cfg.workspace_dir, cfg.security.audit.log_path }) catch {
+        std.debug.print("Out of memory\n", .{});
+        std.process.exit(1);
+    };
+    defer allocator.free(log_path);
+
+    const subcmd = sub_args[0];
+    const aq = yc.security.audit_query;
+
+    if (std.mem.eql(u8, subcmd, "search")) {
+        var filter = aq.SearchFilter{};
+
+        var i: usize = 1;
+        while (i < sub_args.len) : (i += 1) {
+            if (std.mem.eql(u8, sub_args[i], "--actor") and i + 1 < sub_args.len) {
+                i += 1;
+                filter.actor = sub_args[i];
+            } else if (std.mem.eql(u8, sub_args[i], "--action") and i + 1 < sub_args.len) {
+                i += 1;
+                filter.action = sub_args[i];
+            } else if (std.mem.eql(u8, sub_args[i], "--since") and i + 1 < sub_args.len) {
+                i += 1;
+                const duration_secs = aq.parseDuration(sub_args[i]) orelse {
+                    std.debug.print("Invalid duration: {s} (use e.g. 7d, 24h, 30m)\n", .{sub_args[i]});
+                    std.process.exit(1);
+                };
+                filter.since_s = std.time.timestamp() - duration_secs;
+            }
+        }
+
+        const events = aq.searchEvents(allocator, log_path, &filter) catch |err| {
+            std.debug.print("Failed to search audit log: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        defer {
+            for (events) |*ev| aq.freeParsedEvent(allocator, ev);
+            allocator.free(events);
+        }
+
+        aq.printEvents(events);
+    } else if (std.mem.eql(u8, subcmd, "tail")) {
+        var count: usize = 20;
+
+        var i: usize = 1;
+        while (i < sub_args.len) : (i += 1) {
+            if (std.mem.eql(u8, sub_args[i], "-n") and i + 1 < sub_args.len) {
+                i += 1;
+                count = std.fmt.parseInt(usize, sub_args[i], 10) catch {
+                    std.debug.print("Invalid count: {s}\n", .{sub_args[i]});
+                    std.process.exit(1);
+                };
+            }
+        }
+
+        const events = aq.tailEvents(allocator, log_path, count) catch |err| {
+            std.debug.print("Failed to read audit log: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        defer {
+            for (events) |*ev| aq.freeParsedEvent(allocator, ev);
+            allocator.free(events);
+        }
+
+        aq.printEvents(events);
+    } else if (std.mem.eql(u8, subcmd, "stats")) {
+        var stats = aq.computeAuditStats(allocator, log_path) catch |err| {
+            std.debug.print("Failed to compute audit stats: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        defer stats.deinit();
+
+        aq.printStats(&stats);
+    } else {
+        std.debug.print("Unknown audit command: {s}\n", .{subcmd});
+        std.process.exit(1);
+    }
+}
+
 // ── Auth ─────────────────────────────────────────────────────────
 
 fn runAuth(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
@@ -1241,6 +1356,7 @@ fn printUsage() void {
         \\  migrate     Migrate data from other agent runtimes
         \\  models      Manage provider model catalogs
         \\  auth        Manage OAuth authentication (OpenAI Codex)
+        \\  audit       Query and analyze audit logs
         \\  help        Show this help
         \\
         \\OPTIONS:
@@ -1257,6 +1373,7 @@ fn printUsage() void {
         \\  migrate openclaw [--dry-run] [--source PATH]
         \\  models refresh
         \\  auth <login|status|logout> <provider> [--import-codex]
+        \\  audit <search|tail|stats> [options]
         \\
     ;
     std.debug.print("{s}", .{usage});
@@ -1272,5 +1389,6 @@ test "parse known commands" {
     try std.testing.expectEqual(.migrate, parseCommand("migrate").?);
     try std.testing.expectEqual(.models, parseCommand("models").?);
     try std.testing.expectEqual(.auth, parseCommand("auth").?);
+    try std.testing.expectEqual(.audit, parseCommand("audit").?);
     try std.testing.expect(parseCommand("unknown") == null);
 }

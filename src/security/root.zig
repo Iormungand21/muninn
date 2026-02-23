@@ -9,6 +9,7 @@
 //! - RateTracker: sliding-window rate limiting (used by SecurityPolicy)
 
 pub const audit = @import("audit.zig");
+pub const audit_query = @import("audit_query.zig");
 pub const policy = @import("policy.zig");
 pub const pairing = @import("pairing.zig");
 pub const secrets = @import("secrets.zig");
@@ -31,6 +32,15 @@ pub const Action = audit.Action;
 pub const ExecutionResult = audit.ExecutionResult;
 pub const SecurityContext = audit.SecurityContext;
 pub const CommandExecutionLog = audit.CommandExecutionLog;
+
+pub const ParsedEvent = audit_query.ParsedEvent;
+pub const SearchFilter = audit_query.SearchFilter;
+pub const AuditStats = audit_query.AuditStats;
+pub const searchEvents = audit_query.searchEvents;
+pub const tailEvents = audit_query.tailEvents;
+pub const computeAuditStats = audit_query.computeAuditStats;
+pub const parseDuration = audit_query.parseDuration;
+pub const freeParsedEvent = audit_query.freeParsedEvent;
 
 pub const AutonomyLevel = policy.AutonomyLevel;
 pub const CommandRiskLevel = policy.CommandRiskLevel;
