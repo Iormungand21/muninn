@@ -4,12 +4,14 @@ const Tool = root.Tool;
 const ToolResult = root.ToolResult;
 const JsonObjectMap = root.JsonObjectMap;
 const net_security = @import("../root.zig").net_security;
+const reliability = @import("reliability.zig");
 
 /// HTTP request tool for API interactions.
 /// Supports GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS methods with
 /// domain allowlisting, SSRF protection, and header redaction.
 pub const HttpRequestTool = struct {
     allowed_domains: []const []const u8 = &.{}, // empty = allow all
+    health: reliability.ToolHealth = .{},
 
     pub const tool_name = "http_request";
     pub const tool_description = "Make HTTP requests to external APIs. Supports GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS methods. " ++
@@ -18,7 +20,18 @@ pub const HttpRequestTool = struct {
         \\{"type":"object","properties":{"url":{"type":"string","description":"HTTP or HTTPS URL to request"},"method":{"type":"string","description":"HTTP method (GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS)","default":"GET"},"headers":{"type":"object","description":"Optional HTTP headers as key-value pairs"},"body":{"type":"string","description":"Optional request body"}},"required":["url"]}
     ;
 
+    /// HTTP reliability policy: 2 retries with 30s timeout, exponential backoff.
+    pub const reliability_policy = reliability.ToolPolicy{
+        .max_retries = 2,
+        .timeout_ns = 30 * std.time.ns_per_s,
+        .backoff_base_ns = 500 * std.time.ns_per_ms,
+        .backoff_max_ns = 5 * std.time.ns_per_s,
+        .failure_threshold = 5,
+        .recovery_window_ns = 60 * std.time.ns_per_s,
+    };
+
     const vtable = root.ToolVTable(@This());
+    const inner_vtable = reliability.InnerVTable(@This(), @This().executeInner);
 
     pub fn tool(self: *HttpRequestTool) Tool {
         return .{
@@ -28,6 +41,11 @@ pub const HttpRequestTool = struct {
     }
 
     pub fn execute(self: *HttpRequestTool, allocator: std.mem.Allocator, args: JsonObjectMap) !ToolResult {
+        const inner_tool = Tool{ .ptr = @ptrCast(self), .vtable = &inner_vtable };
+        return reliability.reliableExecute(inner_tool, allocator, args, reliability_policy, &self.health);
+    }
+
+    fn executeInner(self: *HttpRequestTool, allocator: std.mem.Allocator, args: JsonObjectMap) !ToolResult {
         const url = root.getString(args, "url") orelse
             return ToolResult.fail("Missing 'url' parameter");
 
@@ -520,4 +538,39 @@ test "parseHeaders basic" {
 test "parseHeaders null returns empty" {
     const headers = try parseHeaders(std.testing.allocator, null);
     try std.testing.expectEqual(@as(usize, 0), headers.len);
+}
+
+// ── Reliability integration tests ──────────────────────────────
+
+test "http_request reliability: policy has 2 retries and 30s timeout" {
+    try std.testing.expectEqual(@as(u32, 2), HttpRequestTool.reliability_policy.max_retries);
+    try std.testing.expectEqual(@as(u64, 30 * std.time.ns_per_s), HttpRequestTool.reliability_policy.timeout_ns.?);
+    try std.testing.expectEqual(@as(u32, 5), HttpRequestTool.reliability_policy.failure_threshold);
+}
+
+test "http_request reliability: health starts healthy" {
+    var ht = HttpRequestTool{};
+    try std.testing.expect(ht.health.isHealthy());
+    try std.testing.expectEqual(@as(u64, 0), ht.health.total_successes);
+}
+
+test "http_request reliability: circuit open rejects execution" {
+    var ht = HttpRequestTool{};
+    ht.health.state = .open;
+    ht.health.opened_at_ns = std.time.nanoTimestamp();
+    const parsed = try root.parseTestArgs("{\"url\": \"https://example.com\"}");
+    defer parsed.deinit();
+    const result = try ht.execute(std.testing.allocator, parsed.value.object);
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "circuit open") != null);
+}
+
+test "http_request reliability: validation failure updates health" {
+    var ht = HttpRequestTool{};
+    const parsed = try root.parseTestArgs("{\"url\": \"ftp://example.com\"}");
+    defer parsed.deinit();
+    const result = try ht.execute(std.testing.allocator, parsed.value.object);
+    try std.testing.expect(!result.success);
+    // Validation failures are retried (1 initial + 2 retries = 3 total failures)
+    try std.testing.expectEqual(@as(u64, 3), ht.health.total_failures);
 }

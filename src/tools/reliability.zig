@@ -179,7 +179,7 @@ pub fn reliableExecute(
         if (attempt > 0) {
             const delay = policy.backoffFor(attempt - 1);
             if (delay > 0) {
-                std.time.sleep(delay);
+                std.Thread.sleep(delay);
             }
         }
 
@@ -201,6 +201,40 @@ pub fn reliableExecute(
     }
 
     return last_result;
+}
+
+/// Generate a Tool.VTable that dispatches `execute` to a named inner function.
+///
+/// Tools that wrap their core logic with `reliableExecute` need two vtables:
+/// - The outer vtable (from `ToolVTable`) routes through the reliability wrapper.
+/// - This inner vtable routes directly to the core logic, avoiding recursion.
+///
+/// Usage:
+///   const inner_vtable = reliability.InnerVTable(@This(), @This().executeInner);
+pub fn InnerVTable(comptime T: type, comptime innerFn: anytype) Tool.VTable {
+    return .{
+        .execute = &struct {
+            fn f(ptr: *anyopaque, allocator: std.mem.Allocator, args: JsonObjectMap) anyerror!ToolResult {
+                const self: *T = @ptrCast(@alignCast(ptr));
+                return innerFn(self, allocator, args);
+            }
+        }.f,
+        .name = &struct {
+            fn f(_: *anyopaque) []const u8 {
+                return T.tool_name;
+            }
+        }.f,
+        .description = &struct {
+            fn f(_: *anyopaque) []const u8 {
+                return T.tool_description;
+            }
+        }.f,
+        .parameters_json = &struct {
+            fn f(_: *anyopaque) []const u8 {
+                return T.tool_params;
+            }
+        }.f,
+    };
 }
 
 // ── Cache types ───────────────────────────────────────────────────

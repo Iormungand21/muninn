@@ -85,9 +85,10 @@ pub const path_security = @import("path_security.zig");
 pub const process_util = @import("process_util.zig");
 pub const reliability = @import("reliability.zig");
 
-// TODO(S1-TOOL-001): Incrementally adopt reliability.reliableExecute in
-// tools that benefit from retries/circuit-breaking (e.g. http_request,
-// shell, delegate). Each tool can attach a ToolPolicy + ToolHealth.
+// Reliability framework (retries + circuit breaker) adopted by:
+// - shell (0 retries, circuit breaker only) — see S3-TOOL-001
+// - http_request (2 retries, 30s timeout) — see S3-TOOL-001
+// - web_search (1 retry, 15s timeout) — see S3-TOOL-001
 
 // ── Core types ──────────────────────────────────────────────────────
 

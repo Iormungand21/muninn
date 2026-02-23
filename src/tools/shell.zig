@@ -6,6 +6,7 @@ const ToolResult = root.ToolResult;
 const JsonObjectMap = root.JsonObjectMap;
 const isResolvedPathAllowed = @import("path_security.zig").isResolvedPathAllowed;
 const SecurityPolicy = @import("../security/policy.zig").SecurityPolicy;
+const reliability = @import("reliability.zig");
 
 /// Default maximum shell command execution time (nanoseconds).
 const DEFAULT_SHELL_TIMEOUT_NS: u64 = 60 * std.time.ns_per_s;
@@ -23,6 +24,7 @@ pub const ShellTool = struct {
     timeout_ns: u64 = DEFAULT_SHELL_TIMEOUT_NS,
     max_output_bytes: usize = DEFAULT_MAX_OUTPUT_BYTES,
     policy: ?*const SecurityPolicy = null,
+    health: reliability.ToolHealth = .{},
 
     pub const tool_name = "shell";
     pub const tool_description = "Execute a shell command in the workspace directory";
@@ -30,7 +32,19 @@ pub const ShellTool = struct {
         \\{"type":"object","properties":{"command":{"type":"string","description":"The shell command to execute"},"cwd":{"type":"string","description":"Working directory (absolute path within allowed paths; defaults to workspace)"}},"required":["command"]}
     ;
 
+    /// Shell reliability policy: no retries (commands are not idempotent),
+    /// circuit breaker after 5 consecutive failures.
+    pub const reliability_policy = reliability.ToolPolicy{
+        .max_retries = 0,
+        .timeout_ns = null,
+        .backoff_base_ns = 0,
+        .backoff_max_ns = 0,
+        .failure_threshold = 5,
+        .recovery_window_ns = 60 * std.time.ns_per_s,
+    };
+
     const vtable = root.ToolVTable(@This());
+    const inner_vtable = reliability.InnerVTable(@This(), @This().executeInner);
 
     pub fn tool(self: *ShellTool) Tool {
         return .{
@@ -40,6 +54,11 @@ pub const ShellTool = struct {
     }
 
     pub fn execute(self: *ShellTool, allocator: std.mem.Allocator, args: JsonObjectMap) !ToolResult {
+        const inner_tool = Tool{ .ptr = @ptrCast(self), .vtable = &inner_vtable };
+        return reliability.reliableExecute(inner_tool, allocator, args, reliability_policy, &self.health);
+    }
+
+    fn executeInner(self: *ShellTool, allocator: std.mem.Allocator, args: JsonObjectMap) !ToolResult {
         // Parse the command from the pre-parsed JSON object
         const command = root.getString(args, "command") orelse
             return ToolResult.fail("Missing 'command' parameter");
@@ -299,4 +318,48 @@ test "shell cwd with allowed_paths runs in cwd" {
 
     try std.testing.expect(result.success);
     try std.testing.expect(std.mem.indexOf(u8, result.output, tmp_path) != null);
+}
+
+// ── Reliability integration tests ───────────────────────────────
+
+test "shell reliability: success updates health" {
+    var st = ShellTool{ .workspace_dir = "." };
+    try std.testing.expect(st.health.isHealthy());
+    const parsed = try root.parseTestArgs("{\"command\": \"echo hi\"}");
+    defer parsed.deinit();
+    const result = try st.execute(std.testing.allocator, parsed.value.object);
+    defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+    defer if (result.error_msg) |e| std.testing.allocator.free(e);
+    try std.testing.expect(result.success);
+    try std.testing.expectEqual(@as(u64, 1), st.health.total_successes);
+    try std.testing.expectEqual(@as(u32, 0), st.health.consecutive_failures);
+}
+
+test "shell reliability: failure updates health" {
+    var st = ShellTool{ .workspace_dir = "." };
+    const parsed = try root.parseTestArgs("{\"command\": \"ls /nonexistent_xyz_42\"}");
+    defer parsed.deinit();
+    const result = try st.execute(std.testing.allocator, parsed.value.object);
+    defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+    defer if (result.error_msg) |e| std.testing.allocator.free(e);
+    try std.testing.expect(!result.success);
+    try std.testing.expectEqual(@as(u64, 1), st.health.total_failures);
+    try std.testing.expectEqual(@as(u32, 1), st.health.consecutive_failures);
+}
+
+test "shell reliability: circuit open rejects execution" {
+    var st = ShellTool{ .workspace_dir = "." };
+    st.health.state = .open;
+    st.health.opened_at_ns = std.time.nanoTimestamp();
+    const parsed = try root.parseTestArgs("{\"command\": \"echo hi\"}");
+    defer parsed.deinit();
+    const result = try st.execute(std.testing.allocator, parsed.value.object);
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "circuit open") != null);
+}
+
+test "shell reliability: policy has zero retries" {
+    try std.testing.expectEqual(@as(u32, 0), ShellTool.reliability_policy.max_retries);
+    try std.testing.expect(ShellTool.reliability_policy.timeout_ns == null);
+    try std.testing.expectEqual(@as(u32, 5), ShellTool.reliability_policy.failure_threshold);
 }

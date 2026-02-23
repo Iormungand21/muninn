@@ -6,6 +6,7 @@
 const std = @import("std");
 const root = @import("root.zig");
 const platform = @import("../platform.zig");
+const reliability = @import("reliability.zig");
 const Tool = root.Tool;
 const ToolResult = root.ToolResult;
 const JsonObjectMap = root.JsonObjectMap;
@@ -17,13 +18,26 @@ const DEFAULT_COUNT: usize = 5;
 
 /// Web search tool using Brave Search API.
 pub const WebSearchTool = struct {
+    health: reliability.ToolHealth = .{},
+
     pub const tool_name = "web_search";
     pub const tool_description = "Search the web using Brave Search API. Returns titles, URLs, and descriptions. Requires BRAVE_API_KEY env var.";
     pub const tool_params =
         \\{"type":"object","properties":{"query":{"type":"string","minLength":1,"description":"Search query"},"count":{"type":"integer","minimum":1,"maximum":10,"default":5,"description":"Number of results (1-10)"}},"required":["query"]}
     ;
 
+    /// Web search reliability policy: 1 retry with 15s timeout, exponential backoff.
+    pub const reliability_policy = reliability.ToolPolicy{
+        .max_retries = 1,
+        .timeout_ns = 15 * std.time.ns_per_s,
+        .backoff_base_ns = 500 * std.time.ns_per_ms,
+        .backoff_max_ns = 5 * std.time.ns_per_s,
+        .failure_threshold = 5,
+        .recovery_window_ns = 60 * std.time.ns_per_s,
+    };
+
     const vtable = root.ToolVTable(@This());
+    const inner_vtable = reliability.InnerVTable(@This(), @This().executeInner);
 
     pub fn tool(self: *WebSearchTool) Tool {
         return .{
@@ -32,7 +46,12 @@ pub const WebSearchTool = struct {
         };
     }
 
-    pub fn execute(_: *WebSearchTool, allocator: std.mem.Allocator, args: JsonObjectMap) !ToolResult {
+    pub fn execute(self: *WebSearchTool, allocator: std.mem.Allocator, args: JsonObjectMap) !ToolResult {
+        const inner_tool = Tool{ .ptr = @ptrCast(self), .vtable = &inner_vtable };
+        return reliability.reliableExecute(inner_tool, allocator, args, reliability_policy, &self.health);
+    }
+
+    fn executeInner(_: *WebSearchTool, allocator: std.mem.Allocator, args: JsonObjectMap) !ToolResult {
         const query = root.getString(args, "query") orelse
             return ToolResult.fail("Missing required 'query' parameter");
 
@@ -322,4 +341,39 @@ test "formatBraveResults no web key" {
 test "formatBraveResults invalid JSON" {
     const result = try formatBraveResults(testing.allocator, "not json", "q");
     try testing.expect(!result.success);
+}
+
+// ── Reliability integration tests ──────────────────────────────
+
+test "web_search reliability: policy has 1 retry and 15s timeout" {
+    try testing.expectEqual(@as(u32, 1), WebSearchTool.reliability_policy.max_retries);
+    try testing.expectEqual(@as(u64, 15 * std.time.ns_per_s), WebSearchTool.reliability_policy.timeout_ns.?);
+    try testing.expectEqual(@as(u32, 5), WebSearchTool.reliability_policy.failure_threshold);
+}
+
+test "web_search reliability: health starts healthy" {
+    var wst = WebSearchTool{};
+    try testing.expect(wst.health.isHealthy());
+    try testing.expectEqual(@as(u64, 0), wst.health.total_successes);
+}
+
+test "web_search reliability: circuit open rejects execution" {
+    var wst = WebSearchTool{};
+    wst.health.state = .open;
+    wst.health.opened_at_ns = std.time.nanoTimestamp();
+    const parsed = try root.parseTestArgs("{\"query\": \"test\"}");
+    defer parsed.deinit();
+    const result = try wst.execute(testing.allocator, parsed.value.object);
+    try testing.expect(!result.success);
+    try testing.expect(std.mem.indexOf(u8, result.error_msg.?, "circuit open") != null);
+}
+
+test "web_search reliability: missing query updates health" {
+    var wst = WebSearchTool{};
+    const parsed = try root.parseTestArgs("{\"count\":5}");
+    defer parsed.deinit();
+    const result = try wst.execute(testing.allocator, parsed.value.object);
+    try testing.expect(!result.success);
+    // Validation failures are retried (1 initial + 1 retry = 2 total failures)
+    try testing.expectEqual(@as(u64, 2), wst.health.total_failures);
 }
