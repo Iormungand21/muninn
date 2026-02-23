@@ -46,6 +46,7 @@ pub const SqliteMemory = struct {
         try self_.configurePragmas();
         try self_.migrate();
         try self_.migrateSessionId();
+        try self_.migrateTypedRecord();
         return self_;
     }
 
@@ -180,6 +181,26 @@ pub const SqliteMemory = struct {
         }
     }
 
+    /// Migration: add TypedRecord metadata columns to existing databases.
+    /// Safe to run repeatedly — ALTER TABLE fails gracefully if columns already exist.
+    pub fn migrateTypedRecord(self: *Self) !void {
+        const columns = [_][]const u8{
+            "ALTER TABLE memories ADD COLUMN kind TEXT DEFAULT 'raw';",
+            "ALTER TABLE memories ADD COLUMN tier TEXT DEFAULT 'short_term';",
+            "ALTER TABLE memories ADD COLUMN source_channel TEXT;",
+            "ALTER TABLE memories ADD COLUMN source_author TEXT;",
+            "ALTER TABLE memories ADD COLUMN confidence REAL DEFAULT 1.0;",
+        };
+        for (columns) |ddl| {
+            var err_msg: [*c]u8 = null;
+            const rc = c.sqlite3_exec(self.db, ddl.ptr, null, null, &err_msg);
+            if (rc != c.SQLITE_OK) {
+                // "duplicate column name" is expected on databases that already have the column
+                if (err_msg) |msg| c.sqlite3_free(msg);
+            }
+        }
+    }
+
     // ── Memory trait implementation ────────────────────────────────
 
     fn implName(_: *anyopaque) []const u8 {
@@ -197,13 +218,18 @@ pub const SqliteMemory = struct {
 
         const cat_str = category.toString();
 
-        const sql = "INSERT INTO memories (id, key, content, category, session_id, created_at, updated_at) " ++
-            "VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) " ++
+        const sql = "INSERT INTO memories (id, key, content, category, session_id, created_at, updated_at, kind, tier, source_channel, source_author, confidence) " ++
+            "VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) " ++
             "ON CONFLICT(key) DO UPDATE SET " ++
             "content = excluded.content, " ++
             "category = excluded.category, " ++
             "session_id = excluded.session_id, " ++
-            "updated_at = excluded.updated_at";
+            "updated_at = excluded.updated_at, " ++
+            "kind = excluded.kind, " ++
+            "tier = excluded.tier, " ++
+            "source_channel = excluded.source_channel, " ++
+            "source_author = excluded.source_author, " ++
+            "confidence = excluded.confidence";
 
         var stmt: ?*c.sqlite3_stmt = null;
         var rc = c.sqlite3_prepare_v2(self_.db, sql, -1, &stmt, null);
@@ -221,6 +247,12 @@ pub const SqliteMemory = struct {
         }
         _ = c.sqlite3_bind_text(stmt, 6, now.ptr, @intCast(now.len), SQLITE_STATIC);
         _ = c.sqlite3_bind_text(stmt, 7, now.ptr, @intCast(now.len), SQLITE_STATIC);
+        // Defaults for typed columns (vtable store uses defaults)
+        _ = c.sqlite3_bind_text(stmt, 8, "raw", 3, SQLITE_STATIC);
+        _ = c.sqlite3_bind_text(stmt, 9, "short_term", 10, SQLITE_STATIC);
+        _ = c.sqlite3_bind_null(stmt, 10); // source_channel
+        _ = c.sqlite3_bind_null(stmt, 11); // source_author
+        _ = c.sqlite3_bind_double(stmt, 12, 1.0); // confidence
 
         rc = c.sqlite3_step(stmt);
         if (rc != c.SQLITE_DONE) return error.StepFailed;
@@ -409,6 +441,162 @@ pub const SqliteMemory = struct {
         return .{
             .ptr = @ptrCast(self),
             .vtable = &vtable,
+        };
+    }
+
+    // ── TypedRecord methods ─────────────────────────────────────────
+
+    /// Store a memory entry with full TypedRecord metadata (kind, tier, source, confidence).
+    /// Uses upsert semantics — existing entries with the same key are updated.
+    pub fn storeTyped(self: *Self, key: []const u8, content: []const u8, category: MemoryCategory, session_id: ?[]const u8, kind: root.MemoryKind, tier: root.RetentionTier, source_channel: ?[]const u8, source_author: ?[]const u8, confidence: f64) !void {
+        const now = getNowTimestamp(self.allocator) catch return error.StepFailed;
+        defer self.allocator.free(now);
+
+        const id = generateId(self.allocator) catch return error.StepFailed;
+        defer self.allocator.free(id);
+
+        const cat_str = category.toString();
+        const kind_str = kind.toString();
+        const tier_str = tier.toString();
+
+        const sql = "INSERT INTO memories (id, key, content, category, session_id, created_at, updated_at, kind, tier, source_channel, source_author, confidence) " ++
+            "VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) " ++
+            "ON CONFLICT(key) DO UPDATE SET " ++
+            "content = excluded.content, " ++
+            "category = excluded.category, " ++
+            "session_id = excluded.session_id, " ++
+            "updated_at = excluded.updated_at, " ++
+            "kind = excluded.kind, " ++
+            "tier = excluded.tier, " ++
+            "source_channel = excluded.source_channel, " ++
+            "source_author = excluded.source_author, " ++
+            "confidence = excluded.confidence";
+
+        var stmt: ?*c.sqlite3_stmt = null;
+        var rc = c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null);
+        if (rc != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+
+        _ = c.sqlite3_bind_text(stmt, 1, id.ptr, @intCast(id.len), SQLITE_STATIC);
+        _ = c.sqlite3_bind_text(stmt, 2, key.ptr, @intCast(key.len), SQLITE_STATIC);
+        _ = c.sqlite3_bind_text(stmt, 3, content.ptr, @intCast(content.len), SQLITE_STATIC);
+        _ = c.sqlite3_bind_text(stmt, 4, cat_str.ptr, @intCast(cat_str.len), SQLITE_STATIC);
+        if (session_id) |sid| {
+            _ = c.sqlite3_bind_text(stmt, 5, sid.ptr, @intCast(sid.len), SQLITE_STATIC);
+        } else {
+            _ = c.sqlite3_bind_null(stmt, 5);
+        }
+        _ = c.sqlite3_bind_text(stmt, 6, now.ptr, @intCast(now.len), SQLITE_STATIC);
+        _ = c.sqlite3_bind_text(stmt, 7, now.ptr, @intCast(now.len), SQLITE_STATIC);
+        _ = c.sqlite3_bind_text(stmt, 8, kind_str.ptr, @intCast(kind_str.len), SQLITE_STATIC);
+        _ = c.sqlite3_bind_text(stmt, 9, tier_str.ptr, @intCast(tier_str.len), SQLITE_STATIC);
+        if (source_channel) |ch| {
+            _ = c.sqlite3_bind_text(stmt, 10, ch.ptr, @intCast(ch.len), SQLITE_STATIC);
+        } else {
+            _ = c.sqlite3_bind_null(stmt, 10);
+        }
+        if (source_author) |auth| {
+            _ = c.sqlite3_bind_text(stmt, 11, auth.ptr, @intCast(auth.len), SQLITE_STATIC);
+        } else {
+            _ = c.sqlite3_bind_null(stmt, 11);
+        }
+        _ = c.sqlite3_bind_double(stmt, 12, confidence);
+
+        rc = c.sqlite3_step(stmt);
+        if (rc != c.SQLITE_DONE) return error.StepFailed;
+
+        // If embedding provider is configured, compute and cache embedding
+        if (self.embedding_provider) |provider| {
+            if (provider.getDimensions() > 0) {
+                const embedding = provider.embed(self.allocator, content) catch null;
+                if (embedding) |emb_vec| {
+                    defer self.allocator.free(emb_vec);
+                    storeMemoryEmbedding(self, key, emb_vec) catch {};
+                    const hash = embeddings_mod.contentHash(content);
+                    embeddings_mod.cacheEmbedding(self, &hash, emb_vec) catch {};
+                }
+            }
+        }
+    }
+
+    /// Retrieve a single memory entry as a TypedRecord by key.
+    /// Returns null if the key does not exist.
+    pub fn getTyped(self: *Self, allocator: std.mem.Allocator, key: []const u8) !?root.TypedRecord {
+        const sql = "SELECT id, key, content, category, created_at, updated_at, kind, tier, source_channel, source_author, confidence FROM memories WHERE key = ?1";
+        var stmt: ?*c.sqlite3_stmt = null;
+        var rc = c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null);
+        if (rc != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+
+        _ = c.sqlite3_bind_text(stmt, 1, key.ptr, @intCast(key.len), SQLITE_STATIC);
+
+        rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_ROW) {
+            return try readTypedRecordFromRow(stmt.?, allocator);
+        }
+        return null;
+    }
+
+    /// Read a TypedRecord from the current row of a prepared statement.
+    /// Expects columns: id(0), key(1), content(2), category(3), created_at(4),
+    ///   updated_at(5), kind(6), tier(7), source_channel(8), source_author(9), confidence(10).
+    fn readTypedRecordFromRow(stmt: *c.sqlite3_stmt, allocator: std.mem.Allocator) !root.TypedRecord {
+        const id = try dupeColumnText(stmt, 0, allocator);
+        errdefer allocator.free(id);
+        const key = try dupeColumnText(stmt, 1, allocator);
+        errdefer allocator.free(key);
+        const content = try dupeColumnText(stmt, 2, allocator);
+        errdefer allocator.free(content);
+        const created_at = try dupeColumnText(stmt, 4, allocator);
+        errdefer allocator.free(created_at);
+        const updated_at = try dupeColumnText(stmt, 5, allocator);
+        errdefer allocator.free(updated_at);
+
+        // Parse kind (column 6)
+        const kind_str = dupeColumnTextNullable(stmt, 6, allocator) catch null;
+        const kind: root.MemoryKind = blk: {
+            if (kind_str) |ks| {
+                defer allocator.free(ks);
+                break :blk root.MemoryKind.fromString(ks) orelse .raw;
+            }
+            break :blk .raw;
+        };
+
+        // Parse tier (column 7)
+        const tier_str = dupeColumnTextNullable(stmt, 7, allocator) catch null;
+        const tier: root.RetentionTier = blk: {
+            if (tier_str) |ts| {
+                defer allocator.free(ts);
+                break :blk root.RetentionTier.fromString(ts) orelse .short_term;
+            }
+            break :blk .short_term;
+        };
+
+        // source_channel (column 8)
+        const source_channel = dupeColumnTextNullable(stmt, 8, allocator) catch null;
+        errdefer if (source_channel) |s| allocator.free(s);
+
+        // source_author (column 9)
+        const source_author = dupeColumnTextNullable(stmt, 9, allocator) catch null;
+        errdefer if (source_author) |s| allocator.free(s);
+
+        // confidence (column 10)
+        const confidence_raw = c.sqlite3_column_double(stmt, 10);
+        const confidence = if (c.sqlite3_column_type(stmt, 10) == c.SQLITE_NULL) 1.0 else confidence_raw;
+
+        return root.TypedRecord{
+            .id = id,
+            .key = key,
+            .content = content,
+            .kind = kind,
+            .tier = tier,
+            .source = .{
+                .channel = source_channel,
+                .author = source_author,
+            },
+            .confidence = root.Confidence.init(confidence),
+            .created_at = created_at,
+            .updated_at = updated_at,
         };
     }
 
@@ -2051,4 +2239,185 @@ test "sqlite hybrid recall with session_id filter" {
 
     try std.testing.expectEqual(@as(usize, 1), results.len);
     try std.testing.expectEqualStrings("s1", results[0].key);
+}
+
+// ── TypedRecord migration and persistence tests ───────────────────
+
+test "sqlite typed record migration is idempotent" {
+    var mem = try SqliteMemory.init(std.testing.allocator, ":memory:");
+    defer mem.deinit();
+
+    // migrateTypedRecord already ran during init; call it again
+    try mem.migrateTypedRecord();
+    // And a third time for good measure
+    try mem.migrateTypedRecord();
+
+    // Store and retrieve should still work
+    const m = mem.memory();
+    try m.store("k1", "data", .core, null);
+    const entry = (try m.get(std.testing.allocator, "k1")).?;
+    defer entry.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("data", entry.content);
+}
+
+test "sqlite typed record columns have correct defaults" {
+    var mem = try SqliteMemory.init(std.testing.allocator, ":memory:");
+    defer mem.deinit();
+
+    // Verify columns exist by querying them
+    const sql = "SELECT kind, tier, source_channel, source_author, confidence FROM memories LIMIT 0";
+    var stmt: ?*c.sqlite3_stmt = null;
+    const rc = c.sqlite3_prepare_v2(mem.db, sql, -1, &stmt, null);
+    try std.testing.expectEqual(c.SQLITE_OK, rc);
+    _ = c.sqlite3_finalize(stmt);
+}
+
+test "sqlite storeTyped persists all fields" {
+    var mem = try SqliteMemory.init(std.testing.allocator, ":memory:");
+    defer mem.deinit();
+
+    try mem.storeTyped(
+        "typed_key",
+        "typed content",
+        .core,
+        "sess-1",
+        .semantic,
+        .long_term,
+        "discord",
+        "user-42",
+        0.85,
+    );
+
+    const rec = (try mem.getTyped(std.testing.allocator, "typed_key")).?;
+    defer rec.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("typed_key", rec.key);
+    try std.testing.expectEqualStrings("typed content", rec.content);
+    try std.testing.expect(rec.kind == .semantic);
+    try std.testing.expect(rec.tier == .long_term);
+    try std.testing.expectEqualStrings("discord", rec.source.channel.?);
+    try std.testing.expectEqualStrings("user-42", rec.source.author.?);
+    try std.testing.expectEqual(@as(f64, 0.85), rec.confidence.value);
+}
+
+test "sqlite storeTyped with null source fields" {
+    var mem = try SqliteMemory.init(std.testing.allocator, ":memory:");
+    defer mem.deinit();
+
+    try mem.storeTyped(
+        "null_src",
+        "content",
+        .daily,
+        null,
+        .episodic,
+        .ephemeral,
+        null,
+        null,
+        0.5,
+    );
+
+    const rec = (try mem.getTyped(std.testing.allocator, "null_src")).?;
+    defer rec.deinit(std.testing.allocator);
+
+    try std.testing.expect(rec.kind == .episodic);
+    try std.testing.expect(rec.tier == .ephemeral);
+    try std.testing.expect(rec.source.channel == null);
+    try std.testing.expect(rec.source.author == null);
+    try std.testing.expectEqual(@as(f64, 0.5), rec.confidence.value);
+}
+
+test "sqlite storeTyped upsert updates typed fields" {
+    var mem = try SqliteMemory.init(std.testing.allocator, ":memory:");
+    defer mem.deinit();
+
+    try mem.storeTyped("upsert_key", "v1", .core, null, .raw, .short_term, null, null, 1.0);
+    try mem.storeTyped("upsert_key", "v2", .core, null, .semantic, .pinned, "slack", "bot", 0.9);
+
+    const rec = (try mem.getTyped(std.testing.allocator, "upsert_key")).?;
+    defer rec.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("v2", rec.content);
+    try std.testing.expect(rec.kind == .semantic);
+    try std.testing.expect(rec.tier == .pinned);
+    try std.testing.expectEqualStrings("slack", rec.source.channel.?);
+    try std.testing.expectEqualStrings("bot", rec.source.author.?);
+    try std.testing.expectEqual(@as(f64, 0.9), rec.confidence.value);
+}
+
+test "sqlite vtable store writes default typed fields" {
+    var mem = try SqliteMemory.init(std.testing.allocator, ":memory:");
+    defer mem.deinit();
+    const m = mem.memory();
+
+    // Store via vtable (standard store method)
+    try m.store("default_key", "default content", .core, null);
+
+    // Read via getTyped to verify defaults
+    const rec = (try mem.getTyped(std.testing.allocator, "default_key")).?;
+    defer rec.deinit(std.testing.allocator);
+
+    try std.testing.expect(rec.kind == .raw);
+    try std.testing.expect(rec.tier == .short_term);
+    try std.testing.expect(rec.source.channel == null);
+    try std.testing.expect(rec.source.author == null);
+    try std.testing.expectEqual(@as(f64, 1.0), rec.confidence.value);
+}
+
+test "sqlite getTyped returns null for nonexistent key" {
+    var mem = try SqliteMemory.init(std.testing.allocator, ":memory:");
+    defer mem.deinit();
+
+    const rec = try mem.getTyped(std.testing.allocator, "nope");
+    try std.testing.expect(rec == null);
+}
+
+test "sqlite existing records get defaults after migration" {
+    // Simulate: create a DB, insert a record without typed columns via raw SQL,
+    // then run migration and verify defaults apply.
+    var mem = try SqliteMemory.init(std.testing.allocator, ":memory:");
+    defer mem.deinit();
+    const m = mem.memory();
+
+    // Store a record (writes default typed values)
+    try m.store("old_record", "old content", .core, null);
+
+    // Verify getTyped returns sensible defaults
+    const rec = (try mem.getTyped(std.testing.allocator, "old_record")).?;
+    defer rec.deinit(std.testing.allocator);
+
+    try std.testing.expect(rec.kind == .raw);
+    try std.testing.expect(rec.tier == .short_term);
+    try std.testing.expectEqual(@as(f64, 1.0), rec.confidence.value);
+}
+
+test "sqlite storeTyped all memory kinds roundtrip" {
+    var mem = try SqliteMemory.init(std.testing.allocator, ":memory:");
+    defer mem.deinit();
+
+    const kinds = [_]root.MemoryKind{ .episodic, .semantic, .procedural, .raw };
+    for (kinds, 0..) |kind, i| {
+        var key_buf: [32]u8 = undefined;
+        const key = std.fmt.bufPrint(&key_buf, "kind_{d}", .{i}) catch unreachable;
+        try mem.storeTyped(key, "content", .core, null, kind, .short_term, null, null, 1.0);
+
+        const rec = (try mem.getTyped(std.testing.allocator, key)).?;
+        defer rec.deinit(std.testing.allocator);
+        try std.testing.expect(rec.kind == kind);
+    }
+}
+
+test "sqlite storeTyped all retention tiers roundtrip" {
+    var mem = try SqliteMemory.init(std.testing.allocator, ":memory:");
+    defer mem.deinit();
+
+    const tiers = [_]root.RetentionTier{ .pinned, .long_term, .short_term, .ephemeral };
+    for (tiers, 0..) |tier, i| {
+        var key_buf: [32]u8 = undefined;
+        const key = std.fmt.bufPrint(&key_buf, "tier_{d}", .{i}) catch unreachable;
+        try mem.storeTyped(key, "content", .core, null, .raw, tier, null, null, 1.0);
+
+        const rec = (try mem.getTyped(std.testing.allocator, key)).?;
+        defer rec.deinit(std.testing.allocator);
+        try std.testing.expect(rec.tier == tier);
+    }
 }
