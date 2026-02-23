@@ -16,6 +16,8 @@ const MemoryCategory = root.MemoryCategory;
 const MemoryEntry = root.MemoryEntry;
 const decay = root.decay;
 const Confidence = root.Confidence;
+const embeddings_mod = root.embeddings;
+const vector_mod = root.vector;
 
 pub const c = @cImport({
     @cInclude("sqlite3.h");
@@ -26,6 +28,9 @@ pub const SQLITE_STATIC: c.sqlite3_destructor_type = null;
 pub const SqliteMemory = struct {
     db: ?*c.sqlite3,
     allocator: std.mem.Allocator,
+    embedding_provider: ?embeddings_mod.EmbeddingProvider = null,
+    vector_weight: f32 = 0.7,
+    keyword_weight: f32 = 0.3,
 
     const Self = @This();
 
@@ -219,6 +224,19 @@ pub const SqliteMemory = struct {
 
         rc = c.sqlite3_step(stmt);
         if (rc != c.SQLITE_DONE) return error.StepFailed;
+
+        // If embedding provider is configured, compute and cache embedding
+        if (self_.embedding_provider) |provider| {
+            if (provider.getDimensions() > 0) {
+                const embedding = provider.embed(self_.allocator, content) catch null;
+                if (embedding) |emb_vec| {
+                    defer self_.allocator.free(emb_vec);
+                    storeMemoryEmbedding(self_, key, emb_vec) catch {};
+                    const hash = embeddings_mod.contentHash(content);
+                    embeddings_mod.cacheEmbedding(self_, &hash, emb_vec) catch {};
+                }
+            }
+        }
     }
 
     fn implRecall(ptr: *anyopaque, allocator: std.mem.Allocator, query: []const u8, limit: usize, session_id: ?[]const u8) anyerror![]MemoryEntry {
@@ -227,6 +245,16 @@ pub const SqliteMemory = struct {
         const trimmed = std.mem.trim(u8, query, " \t\n\r");
         if (trimmed.len == 0) return allocator.alloc(MemoryEntry, 0);
 
+        // If embedding provider available, try hybrid vector+keyword search
+        if (self_.embedding_provider) |provider| {
+            if (provider.getDimensions() > 0) {
+                if (hybridRecall(self_, allocator, trimmed, limit, session_id)) |results| {
+                    return results;
+                } else |_| {}
+            }
+        }
+
+        // Keyword-only fallback
         const results = try fts5Search(self_, allocator, trimmed, limit, session_id);
         if (results.len > 0) {
             applyDecayRanking(results);
@@ -239,9 +267,7 @@ pub const SqliteMemory = struct {
         return like_results;
     }
 
-    fn implGet(ptr: *anyopaque, allocator: std.mem.Allocator, key: []const u8) anyerror!?MemoryEntry {
-        const self_: *Self = @ptrCast(@alignCast(ptr));
-
+    fn getByKey(self_: *Self, allocator: std.mem.Allocator, key: []const u8) !?MemoryEntry {
         const sql = "SELECT id, key, content, category, created_at, session_id FROM memories WHERE key = ?1";
         var stmt: ?*c.sqlite3_stmt = null;
         var rc = c.sqlite3_prepare_v2(self_.db, sql, -1, &stmt, null);
@@ -255,6 +281,11 @@ pub const SqliteMemory = struct {
             return try readEntryFromRow(stmt.?, allocator);
         }
         return null;
+    }
+
+    fn implGet(ptr: *anyopaque, allocator: std.mem.Allocator, key: []const u8) anyerror!?MemoryEntry {
+        const self_: *Self = @ptrCast(@alignCast(ptr));
+        return getByKey(self_, allocator, key);
     }
 
     fn implList(ptr: *anyopaque, allocator: std.mem.Allocator, category: ?MemoryCategory, session_id: ?[]const u8) anyerror![]MemoryEntry {
@@ -654,6 +685,169 @@ pub const SqliteMemory = struct {
                 return (a.score orelse 0) > (b.score orelse 0);
             }
         }.lessThan);
+    }
+
+    // ── Hybrid search helpers ──────────────────────────────────────
+
+    const VecSearchResult = struct {
+        key: []u8, // owned by caller
+        score: f32,
+    };
+
+    /// Store an embedding vector in the memory_embeddings table, keyed by memory key.
+    fn storeMemoryEmbedding(self_: *Self, key: []const u8, embedding: []const f32) !void {
+        var json_buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer json_buf.deinit(self_.allocator);
+
+        try json_buf.append(self_.allocator, '[');
+        for (embedding, 0..) |val, i| {
+            if (i > 0) try json_buf.append(self_.allocator, ',');
+            var tmp: [32]u8 = undefined;
+            const s = std.fmt.bufPrint(&tmp, "{d}", .{val}) catch return error.FormatError;
+            try json_buf.appendSlice(self_.allocator, s);
+        }
+        try json_buf.append(self_.allocator, ']');
+
+        const sql = "INSERT OR REPLACE INTO memory_embeddings (memory_key, embedding) VALUES (?1, ?2)";
+        var stmt: ?*c.sqlite3_stmt = null;
+        var rc = c.sqlite3_prepare_v2(self_.db, sql, -1, &stmt, null);
+        if (rc != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+
+        _ = c.sqlite3_bind_text(stmt, 1, key.ptr, @intCast(key.len), SQLITE_STATIC);
+        _ = c.sqlite3_bind_text(stmt, 2, json_buf.items.ptr, @intCast(json_buf.items.len), SQLITE_STATIC);
+
+        rc = c.sqlite3_step(stmt);
+        if (rc != c.SQLITE_DONE) return error.StepFailed;
+    }
+
+    /// Scan memory_embeddings for cosine similarity against a query embedding.
+    /// Returns owned VecSearchResult slice with keys that must be freed by caller.
+    fn vectorSearch(self_: *Self, allocator: std.mem.Allocator, query_emb: []const f32, session_id: ?[]const u8) ![]VecSearchResult {
+        const sql = if (session_id != null)
+            "SELECT me.memory_key, me.embedding FROM memory_embeddings me " ++
+                "JOIN memories m ON m.key = me.memory_key WHERE m.session_id = ?1"
+        else
+            "SELECT memory_key, embedding FROM memory_embeddings";
+
+        var stmt: ?*c.sqlite3_stmt = null;
+        var rc = c.sqlite3_prepare_v2(self_.db, sql, -1, &stmt, null);
+        if (rc != c.SQLITE_OK) return allocator.alloc(VecSearchResult, 0);
+        defer _ = c.sqlite3_finalize(stmt);
+
+        if (session_id) |sid| {
+            _ = c.sqlite3_bind_text(stmt, 1, sid.ptr, @intCast(sid.len), SQLITE_STATIC);
+        }
+
+        var results: std.ArrayList(VecSearchResult) = .empty;
+        errdefer {
+            for (results.items) |r| allocator.free(r.key);
+            results.deinit(allocator);
+        }
+
+        while (true) {
+            rc = c.sqlite3_step(stmt.?);
+            if (rc != c.SQLITE_ROW) break;
+
+            const key_raw = c.sqlite3_column_text(stmt.?, 0);
+            const key_len: usize = @intCast(c.sqlite3_column_bytes(stmt.?, 0));
+            if (key_raw == null or key_len == 0) continue;
+
+            const emb_raw = c.sqlite3_column_text(stmt.?, 1);
+            const emb_len: usize = @intCast(c.sqlite3_column_bytes(stmt.?, 1));
+            if (emb_raw == null or emb_len == 0) continue;
+
+            const emb_json: []const u8 = @as([*]const u8, @ptrCast(emb_raw))[0..emb_len];
+
+            // Parse embedding JSON
+            const parsed = std.json.parseFromSlice(std.json.Value, allocator, emb_json, .{}) catch continue;
+            defer parsed.deinit();
+
+            const arr = switch (parsed.value) {
+                .array => |a| a,
+                else => continue,
+            };
+
+            const stored_emb = allocator.alloc(f32, arr.items.len) catch continue;
+            defer allocator.free(stored_emb);
+
+            for (arr.items, 0..) |val, i| {
+                stored_emb[i] = switch (val) {
+                    .float => |f| @floatCast(f),
+                    .integer => |n| @floatFromInt(n),
+                    else => 0.0,
+                };
+            }
+
+            const sim = vector_mod.cosineSimilarity(query_emb, stored_emb);
+            if (sim > 0.01) {
+                const key_slice: []const u8 = @as([*]const u8, @ptrCast(key_raw))[0..key_len];
+                const key = try allocator.dupe(u8, key_slice);
+                try results.append(allocator, .{ .key = key, .score = sim });
+            }
+        }
+
+        return results.toOwnedSlice(allocator);
+    }
+
+    /// Hybrid recall: combine FTS5 keyword search with vector similarity search.
+    /// Falls through with error if embedding fails, allowing keyword-only fallback.
+    fn hybridRecall(self_: *Self, allocator: std.mem.Allocator, query: []const u8, limit: usize, session_id: ?[]const u8) ![]MemoryEntry {
+        const provider = self_.embedding_provider.?;
+
+        // Step 1: Keyword search (fetch extra candidates for merging)
+        const kw_entries = try fts5Search(self_, allocator, query, limit * 2, session_id);
+        defer root.freeEntries(allocator, kw_entries);
+
+        // Step 2: Compute query embedding
+        const query_emb = try provider.embed(allocator, query);
+        defer allocator.free(query_emb);
+
+        // Step 3: Vector search
+        const vec_results = try vectorSearch(self_, allocator, query_emb, session_id);
+        defer {
+            for (vec_results) |r| allocator.free(r.key);
+            allocator.free(vec_results);
+        }
+
+        if (kw_entries.len == 0 and vec_results.len == 0) {
+            return allocator.alloc(MemoryEntry, 0);
+        }
+
+        // Step 4: Build IdScore arrays for hybridMerge
+        const kw_scores = try allocator.alloc(vector_mod.IdScore, kw_entries.len);
+        defer allocator.free(kw_scores);
+        for (kw_entries, 0..) |entry, i| {
+            kw_scores[i] = .{ .id = entry.key, .score = @floatCast(entry.score orelse 1.0) };
+        }
+
+        const vec_id_scores = try allocator.alloc(vector_mod.IdScore, vec_results.len);
+        defer allocator.free(vec_id_scores);
+        for (vec_results, 0..) |r, i| {
+            vec_id_scores[i] = .{ .id = r.key, .score = r.score };
+        }
+
+        // Step 5: Hybrid merge
+        const merged = try vector_mod.hybridMerge(allocator, vec_id_scores, kw_scores, self_.vector_weight, self_.keyword_weight, limit);
+        defer allocator.free(merged);
+
+        // Step 6: Build result entries by fetching each from DB
+        var results: std.ArrayList(MemoryEntry) = .empty;
+        errdefer {
+            for (results.items) |*e| e.deinit(allocator);
+            results.deinit(allocator);
+        }
+
+        for (merged) |sr| {
+            if (try getByKey(self_, allocator, sr.id)) |entry_val| {
+                var e = entry_val;
+                const score: f64 = @floatCast(sr.final_score);
+                e.score = score;
+                try results.append(allocator, e);
+            }
+        }
+
+        return results.toOwnedSlice(allocator);
     }
 
     // ── Utility functions ──────────────────────────────────────────
@@ -1675,4 +1869,186 @@ test "sqlite recall decay applies to like-search fallback" {
     try std.testing.expect(results.len == 2);
     // Newer entry should score higher due to less decay
     try std.testing.expect(results[0].score.? >= results[1].score.?);
+}
+
+// ── Hybrid vector+keyword search tests ────────────────────────────
+
+/// Test-only deterministic embedding provider that produces 3-dimensional vectors.
+/// Embeddings are based on keyword content for predictable cosine similarity.
+const TestEmbedding = struct {
+    allocator: ?std.mem.Allocator = null,
+
+    const TSelf = @This();
+
+    fn implName(_: *anyopaque) []const u8 {
+        return "test";
+    }
+
+    fn implDimensions(_: *anyopaque) u32 {
+        return 3;
+    }
+
+    fn implEmbed(_: *anyopaque, alloc: std.mem.Allocator, text: []const u8) anyerror![]f32 {
+        const result = try alloc.alloc(f32, 3);
+        if (std.mem.indexOf(u8, text, "Zig") != null or std.mem.indexOf(u8, text, "zig") != null) {
+            result[0] = 0.9;
+            result[1] = 0.1;
+            result[2] = 0.0;
+        } else if (std.mem.indexOf(u8, text, "Rust") != null or std.mem.indexOf(u8, text, "rust") != null) {
+            result[0] = 0.1;
+            result[1] = 0.9;
+            result[2] = 0.0;
+        } else if (std.mem.indexOf(u8, text, "Python") != null or std.mem.indexOf(u8, text, "python") != null) {
+            result[0] = 0.0;
+            result[1] = 0.1;
+            result[2] = 0.9;
+        } else {
+            result[0] = 0.5;
+            result[1] = 0.5;
+            result[2] = 0.5;
+        }
+        return result;
+    }
+
+    fn implDeinit(ptr: *anyopaque) void {
+        const self_: *TSelf = @ptrCast(@alignCast(ptr));
+        if (self_.allocator) |alloc| alloc.destroy(self_);
+    }
+
+    const vtable_ = embeddings_mod.EmbeddingProvider.VTable{
+        .name = &implName,
+        .dimensions = &implDimensions,
+        .embed = &implEmbed,
+        .deinit = &implDeinit,
+    };
+
+    pub fn provider(self: *TSelf) embeddings_mod.EmbeddingProvider {
+        return .{ .ptr = @ptrCast(self), .vtable = &vtable_ };
+    }
+};
+
+test "sqlite store caches embedding when provider configured" {
+    var test_emb = TestEmbedding{};
+    var mem = try SqliteMemory.init(std.testing.allocator, ":memory:");
+    defer mem.deinit();
+    mem.embedding_provider = test_emb.provider();
+
+    const m = mem.memory();
+    try m.store("zig_lang", "Zig is a systems programming language", .core, null);
+
+    // Verify memory_embeddings table was populated
+    const sql = "SELECT COUNT(*) FROM memory_embeddings WHERE memory_key = 'zig_lang'";
+    var stmt: ?*c.sqlite3_stmt = null;
+    var rc = c.sqlite3_prepare_v2(mem.db, sql, -1, &stmt, null);
+    try std.testing.expectEqual(c.SQLITE_OK, rc);
+    defer _ = c.sqlite3_finalize(stmt);
+
+    rc = c.sqlite3_step(stmt);
+    try std.testing.expectEqual(c.SQLITE_ROW, rc);
+    try std.testing.expectEqual(@as(i64, 1), c.sqlite3_column_int64(stmt, 0));
+}
+
+test "sqlite store does not cache embedding when no provider" {
+    var mem = try SqliteMemory.init(std.testing.allocator, ":memory:");
+    defer mem.deinit();
+
+    const m = mem.memory();
+    try m.store("no_emb", "content without embedding", .core, null);
+
+    // Verify memory_embeddings table is empty
+    const sql = "SELECT COUNT(*) FROM memory_embeddings";
+    var stmt: ?*c.sqlite3_stmt = null;
+    var rc = c.sqlite3_prepare_v2(mem.db, sql, -1, &stmt, null);
+    try std.testing.expectEqual(c.SQLITE_OK, rc);
+    defer _ = c.sqlite3_finalize(stmt);
+
+    rc = c.sqlite3_step(stmt);
+    try std.testing.expectEqual(c.SQLITE_ROW, rc);
+    try std.testing.expectEqual(@as(i64, 0), c.sqlite3_column_int64(stmt, 0));
+}
+
+test "sqlite hybrid recall merges vector and keyword results" {
+    var test_emb = TestEmbedding{};
+    var mem = try SqliteMemory.init(std.testing.allocator, ":memory:");
+    defer mem.deinit();
+    mem.embedding_provider = test_emb.provider();
+    mem.vector_weight = 0.7;
+    mem.keyword_weight = 0.3;
+
+    const m = mem.memory();
+    try m.store("zig_lang", "Zig is a systems programming language", .core, null);
+    try m.store("rust_lang", "Rust is also a systems language", .core, null);
+    try m.store("python_lang", "Python is an interpreted language", .core, null);
+
+    // Recall with "Zig" — should use hybrid search, Zig entry should rank highest
+    const results = try m.recall(std.testing.allocator, "Zig systems", 10, null);
+    defer root.freeEntries(std.testing.allocator, results);
+
+    try std.testing.expect(results.len >= 1);
+    // All results should have scores
+    for (results) |entry| {
+        try std.testing.expect(entry.score != null);
+    }
+    // The Zig entry should rank first due to highest vector similarity
+    try std.testing.expectEqualStrings("zig_lang", results[0].key);
+}
+
+test "sqlite hybrid recall falls back on keyword-only when no provider" {
+    var mem = try SqliteMemory.init(std.testing.allocator, ":memory:");
+    defer mem.deinit();
+    // No embedding_provider set
+
+    const m = mem.memory();
+    try m.store("a", "keyword fallback test alpha", .core, null);
+    try m.store("b", "keyword fallback test beta", .core, null);
+
+    const results = try m.recall(std.testing.allocator, "keyword fallback", 10, null);
+    defer root.freeEntries(std.testing.allocator, results);
+
+    // Should still find results via keyword search
+    try std.testing.expectEqual(@as(usize, 2), results.len);
+}
+
+test "sqlite hybrid recall respects config weights" {
+    var test_emb = TestEmbedding{};
+    var mem = try SqliteMemory.init(std.testing.allocator, ":memory:");
+    defer mem.deinit();
+    mem.embedding_provider = test_emb.provider();
+
+    const m = mem.memory();
+    try m.store("zig_fact", "Zig has comptime evaluation", .core, null);
+    try m.store("rust_fact", "Rust has a borrow checker", .core, null);
+
+    // With high vector weight, Zig query should strongly prefer Zig entry
+    mem.vector_weight = 0.9;
+    mem.keyword_weight = 0.1;
+    const results_vec = try m.recall(std.testing.allocator, "Zig", 10, null);
+    defer root.freeEntries(std.testing.allocator, results_vec);
+    try std.testing.expect(results_vec.len >= 1);
+    try std.testing.expectEqualStrings("zig_fact", results_vec[0].key);
+
+    // With high keyword weight, results should still work
+    mem.vector_weight = 0.1;
+    mem.keyword_weight = 0.9;
+    const results_kw = try m.recall(std.testing.allocator, "Zig", 10, null);
+    defer root.freeEntries(std.testing.allocator, results_kw);
+    try std.testing.expect(results_kw.len >= 1);
+}
+
+test "sqlite hybrid recall with session_id filter" {
+    var test_emb = TestEmbedding{};
+    var mem = try SqliteMemory.init(std.testing.allocator, ":memory:");
+    defer mem.deinit();
+    mem.embedding_provider = test_emb.provider();
+
+    const m = mem.memory();
+    try m.store("s1", "Zig session one data", .core, "sess-a");
+    try m.store("s2", "Zig session two data", .core, "sess-b");
+
+    // Session A should only see its own entry
+    const results = try m.recall(std.testing.allocator, "Zig", 10, "sess-a");
+    defer root.freeEntries(std.testing.allocator, results);
+
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("s1", results[0].key);
 }
