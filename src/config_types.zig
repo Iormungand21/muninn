@@ -196,6 +196,7 @@ pub const MemoryConfig = struct {
     snapshot_enabled: bool = false,
     snapshot_on_hygiene: bool = false,
     auto_hydrate: bool = true,
+    consolidation_enabled: bool = false,
 };
 
 // ── Tunnel config ───────────────────────────────────────────────

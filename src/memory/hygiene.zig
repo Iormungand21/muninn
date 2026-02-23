@@ -9,6 +9,7 @@
 const std = @import("std");
 const root = @import("root.zig");
 const Memory = root.Memory;
+const consolidation = @import("consolidation.zig");
 
 /// Default hygiene interval in seconds (12 hours).
 const HYGIENE_INTERVAL_SECS: i64 = 12 * 60 * 60;
@@ -21,9 +22,10 @@ pub const HygieneReport = struct {
     archived_memory_files: u64 = 0,
     purged_memory_archives: u64 = 0,
     pruned_conversation_rows: u64 = 0,
+    consolidated_records: u64 = 0,
 
     pub fn totalActions(self: *const HygieneReport) u64 {
-        return self.archived_memory_files + self.purged_memory_archives + self.pruned_conversation_rows;
+        return self.archived_memory_files + self.purged_memory_archives + self.pruned_conversation_rows + self.consolidated_records;
     }
 };
 
@@ -34,6 +36,7 @@ pub const HygieneConfig = struct {
     purge_after_days: u32 = 30,
     conversation_retention_days: u32 = 30,
     workspace_dir: []const u8 = "",
+    consolidation_enabled: bool = false,
 };
 
 /// Run memory hygiene if the cadence window has elapsed.
@@ -59,6 +62,20 @@ pub fn runIfDue(allocator: std.mem.Allocator, config: HygieneConfig, mem: ?Memor
     if (config.conversation_retention_days > 0) {
         if (mem) |m| {
             report.pruned_conversation_rows = pruneConversationRows(allocator, m, config.conversation_retention_days) catch 0;
+        }
+    }
+
+    // Consolidate episodic memories into semantic summaries
+    if (config.consolidation_enabled) {
+        if (mem) |m| {
+            if (m.asSqlite()) |sqlite_mem| {
+                const cr = consolidation.runConsolidation(
+                    allocator,
+                    sqlite_mem,
+                    consolidation.DEFAULT_AGE_THRESHOLD_SECS,
+                );
+                report.consolidated_records = cr.semantic_records_created;
+            }
         }
     }
 
