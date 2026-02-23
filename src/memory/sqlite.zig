@@ -14,6 +14,8 @@ const root = @import("root.zig");
 const Memory = root.Memory;
 const MemoryCategory = root.MemoryCategory;
 const MemoryEntry = root.MemoryEntry;
+const decay = root.decay;
+const Confidence = root.Confidence;
 
 pub const c = @cImport({
     @cInclude("sqlite3.h");
@@ -226,10 +228,15 @@ pub const SqliteMemory = struct {
         if (trimmed.len == 0) return allocator.alloc(MemoryEntry, 0);
 
         const results = try fts5Search(self_, allocator, trimmed, limit, session_id);
-        if (results.len > 0) return results;
+        if (results.len > 0) {
+            applyDecayRanking(results);
+            return results;
+        }
 
         allocator.free(results);
-        return try likeSearch(self_, allocator, trimmed, limit, session_id);
+        const like_results = try likeSearch(self_, allocator, trimmed, limit, session_id);
+        applyDecayRanking(like_results);
+        return like_results;
     }
 
     fn implGet(ptr: *anyopaque, allocator: std.mem.Allocator, key: []const u8) anyerror!?MemoryEntry {
@@ -615,6 +622,38 @@ pub const SqliteMemory = struct {
         }
 
         return entries.toOwnedSlice(allocator);
+    }
+
+    // ── Decay ranking ─────────────────────────────────────────────
+
+    /// Apply confidence decay and recency scoring to recall results, then
+    /// re-rank by composite score (relevance * decayed_confidence + recency tiebreaker).
+    fn applyDecayRanking(entries: []MemoryEntry) void {
+        if (entries.len == 0) return;
+
+        const now = std.time.timestamp();
+        const params = decay.defaultParamsForKind(.raw);
+        // Recency half-life: 24 hours (secondary tiebreaker signal)
+        const recency_half_life: f64 = 24.0 * 3600.0;
+        const recency_weight: f64 = 0.01;
+
+        for (entries) |*entry| {
+            const created_at = std.fmt.parseInt(i64, entry.timestamp, 10) catch 0;
+            const elapsed: f64 = @floatFromInt(@max(now - created_at, 0));
+
+            const decayed = decay.decayConfidence(Confidence.init(1.0), elapsed, params);
+            const recency = decay.recencyScore(elapsed, recency_half_life);
+
+            const base_score = entry.score orelse 1.0;
+            entry.score = base_score * decayed.value + recency_weight * recency;
+        }
+
+        // Sort by composite score descending (higher = more relevant)
+        std.mem.sort(MemoryEntry, entries, {}, struct {
+            fn lessThan(_: void, a: MemoryEntry, b: MemoryEntry) bool {
+                return (a.score orelse 0) > (b.score orelse 0);
+            }
+        }.lessThan);
     }
 
     // ── Utility functions ──────────────────────────────────────────
@@ -1542,4 +1581,98 @@ test "sqlite clearAutoSaved no-op on empty" {
     try mem.clearAutoSaved();
     const m = mem.memory();
     try std.testing.expectEqual(@as(usize, 0), try m.count());
+}
+
+// ── Confidence decay ranking tests ────────────────────────────────
+
+test "sqlite recall ranks recent higher than old at equal relevance" {
+    var mem = try SqliteMemory.init(std.testing.allocator, ":memory:");
+    defer mem.deinit();
+    const m = mem.memory();
+
+    // Store two records with identical content (same keyword relevance)
+    try m.store("old_entry", "unique_decay_test_token", .core, null);
+    try m.store("new_entry", "unique_decay_test_token", .core, null);
+
+    // Backdate the "old_entry" created_at to 7 days ago
+    const now = std.time.timestamp();
+    const seven_days_ago = now - 7 * 24 * 3600;
+    var ts_buf: [20]u8 = undefined;
+    const old_ts = std.fmt.bufPrint(&ts_buf, "{d}", .{seven_days_ago}) catch unreachable;
+
+    const update_sql = "UPDATE memories SET created_at = ?1 WHERE key = 'old_entry'";
+    var stmt: ?*c.sqlite3_stmt = null;
+    var rc = c.sqlite3_prepare_v2(mem.db, update_sql, -1, &stmt, null);
+    try std.testing.expectEqual(c.SQLITE_OK, rc);
+    defer _ = c.sqlite3_finalize(stmt);
+
+    _ = c.sqlite3_bind_text(stmt, 1, old_ts.ptr, @intCast(old_ts.len), SQLITE_STATIC);
+    rc = c.sqlite3_step(stmt);
+    try std.testing.expectEqual(c.SQLITE_DONE, rc);
+
+    // Recall — both match the query equally by BM25
+    const results = try m.recall(std.testing.allocator, "unique_decay_test_token", 10, null);
+    defer root.freeEntries(std.testing.allocator, results);
+
+    try std.testing.expectEqual(@as(usize, 2), results.len);
+    // Newer record should rank first (higher decayed score)
+    try std.testing.expectEqualStrings("new_entry", results[0].key);
+    try std.testing.expectEqualStrings("old_entry", results[1].key);
+    // And have a strictly higher composite score
+    try std.testing.expect(results[0].score.? > results[1].score.?);
+}
+
+test "sqlite recall decay does not drop results" {
+    var mem = try SqliteMemory.init(std.testing.allocator, ":memory:");
+    defer mem.deinit();
+    const m = mem.memory();
+
+    try m.store("s1", "decay_preserves_result alpha", .core, null);
+    try m.store("s2", "decay_preserves_result beta", .core, null);
+
+    const results = try m.recall(std.testing.allocator, "decay_preserves_result", 10, null);
+    defer root.freeEntries(std.testing.allocator, results);
+
+    // Decay re-ranks but never removes results
+    try std.testing.expectEqual(@as(usize, 2), results.len);
+    // All results still have scores
+    for (results) |entry| {
+        try std.testing.expect(entry.score != null);
+        try std.testing.expect(entry.score.? >= 0.0);
+    }
+}
+
+test "sqlite recall decay applies to like-search fallback" {
+    var mem = try SqliteMemory.init(std.testing.allocator, ":memory:");
+    defer mem.deinit();
+    const m = mem.memory();
+
+    // Use keys that match but content that won't match FTS well,
+    // forcing fallback to LIKE search
+    try m.store("xyzzy_old", "niche content alpha", .core, null);
+    try m.store("xyzzy_new", "niche content beta", .core, null);
+
+    // Backdate old entry
+    const now = std.time.timestamp();
+    const three_days_ago = now - 3 * 24 * 3600;
+    var ts_buf: [20]u8 = undefined;
+    const old_ts = std.fmt.bufPrint(&ts_buf, "{d}", .{three_days_ago}) catch unreachable;
+
+    const update_sql = "UPDATE memories SET created_at = ?1 WHERE key = 'xyzzy_old'";
+    var stmt: ?*c.sqlite3_stmt = null;
+    var rc = c.sqlite3_prepare_v2(mem.db, update_sql, -1, &stmt, null);
+    try std.testing.expectEqual(c.SQLITE_OK, rc);
+    defer _ = c.sqlite3_finalize(stmt);
+
+    _ = c.sqlite3_bind_text(stmt, 1, old_ts.ptr, @intCast(old_ts.len), SQLITE_STATIC);
+    rc = c.sqlite3_step(stmt);
+    try std.testing.expectEqual(c.SQLITE_DONE, rc);
+
+    // Search by key prefix — both match via LIKE fallback
+    const results = try m.recall(std.testing.allocator, "xyzzy", 10, null);
+    defer root.freeEntries(std.testing.allocator, results);
+
+    try std.testing.expect(results.len == 2);
+    // Newer entry should score higher due to less decay
+    try std.testing.expect(results[0].score.? >= results[1].score.?);
 }
