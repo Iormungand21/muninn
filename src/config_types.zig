@@ -150,6 +150,7 @@ pub const DiscordConfig = struct {
     allow_from: []const []const u8 = &.{},
     mention_only: bool = true,
     intents: u32 = 37377, // GUILDS|GUILD_MESSAGES|MESSAGE_CONTENT|DIRECT_MESSAGES
+    auto_thread_after: u32 = 0, // 0 = disabled; create thread after N turns in a channel
 };
 
 pub const SlackConfig = struct {

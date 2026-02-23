@@ -24,6 +24,10 @@ pub const DiscordChannel = struct {
     // Conversation mode — channels where bot responds to all messages
     conversation_channels: std.StringHashMapUnmanaged(void) = .empty,
 
+    // Thread support — per-channel turn counts for auto-threading
+    auto_thread_after: u32 = 0, // 0 = disabled
+    turn_counts: std.StringHashMapUnmanaged(u32) = .empty,
+
     // Gateway state
     running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     sequence: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
@@ -214,6 +218,87 @@ pub const DiscordChannel = struct {
             else => return false,
         };
         return std.mem.eql(u8, ref_id_str, bot_user_id);
+    }
+
+    // ── Thread support ──────────────────────────────────────────────
+
+    /// Build a Discord REST API URL for creating a thread from a message.
+    /// POST /channels/{channel_id}/messages/{message_id}/threads
+    pub fn createThreadUrl(buf: []u8, channel_id: []const u8, message_id: []const u8) ![]const u8 {
+        var fbs = std.io.fixedBufferStream(buf);
+        const w = fbs.writer();
+        try w.print("https://discord.com/api/v10/channels/{s}/messages/{s}/threads", .{ channel_id, message_id });
+        return fbs.getWritten();
+    }
+
+    /// Check if a MESSAGE_CREATE payload has a message_reference field (thread/reply context).
+    pub fn hasMessageReference(d_obj: std.json.ObjectMap) bool {
+        return d_obj.get("message_reference") != null;
+    }
+
+    /// Extract the channel_id from a message_reference field (thread context).
+    pub fn getMessageReferenceChannelId(d_obj: std.json.ObjectMap) ?[]const u8 {
+        const ref_val = d_obj.get("message_reference") orelse return null;
+        const ref_obj = switch (ref_val) {
+            .object => |o| o,
+            else => return null,
+        };
+        const chan_val = ref_obj.get("channel_id") orelse return null;
+        return switch (chan_val) {
+            .string => |s| s,
+            else => null,
+        };
+    }
+
+    /// Create a new thread from a message via Discord REST API.
+    /// POST /channels/{channel_id}/messages/{message_id}/threads
+    pub fn createThread(self: *DiscordChannel, channel_id: []const u8, message_id: []const u8, name: []const u8) !void {
+        var url_buf: [512]u8 = undefined;
+        const url = try createThreadUrl(&url_buf, channel_id, message_id);
+
+        var body_list: std.ArrayListUnmanaged(u8) = .empty;
+        defer body_list.deinit(self.allocator);
+
+        try body_list.appendSlice(self.allocator, "{\"name\":");
+        try root.json_util.appendJsonString(&body_list, self.allocator, name);
+        try body_list.appendSlice(self.allocator, ",\"auto_archive_duration\":60}");
+
+        var auth_buf: [512]u8 = undefined;
+        var auth_fbs = std.io.fixedBufferStream(&auth_buf);
+        try auth_fbs.writer().print("Authorization: Bot {s}", .{self.token});
+        const auth_header = auth_fbs.getWritten();
+
+        const resp = root.http_util.curlPost(self.allocator, url, body_list.items, &.{auth_header}) catch |err| {
+            log.err("Discord: thread creation failed: {}", .{err});
+            return error.DiscordApiError;
+        };
+        self.allocator.free(resp);
+    }
+
+    /// Increment the turn count for a channel. Returns the new count.
+    pub fn incrementTurnCount(self: *DiscordChannel, channel_id: []const u8) u32 {
+        if (self.turn_counts.getPtr(channel_id)) |count_ptr| {
+            count_ptr.* += 1;
+            return count_ptr.*;
+        }
+        const key = self.allocator.dupe(u8, channel_id) catch return 1;
+        self.turn_counts.put(self.allocator, key, 1) catch {
+            self.allocator.free(key);
+            return 1;
+        };
+        return 1;
+    }
+
+    /// Reset the turn count for a channel (e.g., after creating a thread).
+    pub fn resetTurnCount(self: *DiscordChannel, channel_id: []const u8) void {
+        if (self.turn_counts.fetchRemove(channel_id)) |entry| {
+            self.allocator.free(entry.key);
+        }
+    }
+
+    /// Get the current turn count for a channel.
+    pub fn getTurnCount(self: *DiscordChannel, channel_id: []const u8) u32 {
+        return self.turn_counts.get(channel_id) orelse 0;
     }
 
     // ── Channel vtable ──────────────────────────────────────────────
@@ -670,6 +755,12 @@ pub const DiscordChannel = struct {
             self.allocator.free(key_ptr.*);
         }
         self.conversation_channels.deinit(self.allocator);
+        // Free turn count keys
+        var turn_it = self.turn_counts.keyIterator();
+        while (turn_it.next()) |key_ptr| {
+            self.allocator.free(key_ptr.*);
+        }
+        self.turn_counts.deinit(self.allocator);
     }
 
     fn vtableSend(ptr: *anyopaque, target: []const u8, message: []const u8) anyerror!void {
@@ -1101,14 +1192,35 @@ pub const DiscordChannel = struct {
         const clean_content_owned = if (self.bot_user_id != null) !std.mem.eql(u8, @as([]const u8, clean_content), @as([]const u8, content)) else false;
         defer if (clean_content_owned) self.allocator.free(clean_content);
 
+        // Thread detection: check for message_reference
+        const in_thread = hasMessageReference(d_obj);
+
+        // Track conversation turns per channel (skip for thread messages)
+        if (!in_thread) {
+            const turns = self.incrementTurnCount(channel_id);
+
+            // Auto-create thread if threshold exceeded
+            if (self.auto_thread_after > 0 and turns >= self.auto_thread_after and message_id.len > 0) {
+                self.createThread(channel_id, message_id, "Continued conversation") catch |err| {
+                    log.warn("Discord: auto-thread creation failed: {}", .{err});
+                };
+                self.resetTurnCount(channel_id);
+            }
+        }
+
         // Build session_key and publish to bus
         const session_key = try std.fmt.allocPrint(self.allocator, "discord:{s}", .{channel_id});
         defer self.allocator.free(session_key);
 
-        // Build metadata JSON with message_id for reaction support
-        var meta_buf: [256]u8 = undefined;
+        // Build metadata JSON with message_id and thread context
+        var meta_buf: [512]u8 = undefined;
         var meta_fbs = std.io.fixedBufferStream(&meta_buf);
-        meta_fbs.writer().print("{{\"message_id\":\"{s}\"}}", .{message_id}) catch {};
+        if (in_thread) {
+            const ref_chan = getMessageReferenceChannelId(d_obj) orelse channel_id;
+            meta_fbs.writer().print("{{\"message_id\":\"{s}\",\"in_thread\":true,\"thread_channel_id\":\"{s}\"}}", .{ message_id, ref_chan }) catch {};
+        } else {
+            meta_fbs.writer().print("{{\"message_id\":\"{s}\",\"in_thread\":false}}", .{message_id}) catch {};
+        }
         const metadata_json: ?[]const u8 = if (meta_fbs.pos > 0) meta_fbs.getWritten() else null;
 
         const msg = try bus_mod.makeInboundFull(
@@ -1518,4 +1630,137 @@ test "discord SLASH_COMMANDS_JSON status has no options" {
     defer parsed.deinit();
     const status_cmd = parsed.value.array.items[3].object;
     try std.testing.expect(status_cmd.get("options") == null);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Thread Support Tests
+// ════════════════════════════════════════════════════════════════════════════
+
+test "discord createThreadUrl builds correct endpoint" {
+    var buf: [512]u8 = undefined;
+    const url = try DiscordChannel.createThreadUrl(&buf, "chan_123", "msg_456");
+    try std.testing.expectEqualStrings("https://discord.com/api/v10/channels/chan_123/messages/msg_456/threads", url);
+}
+
+test "discord createThreadUrl with different ids" {
+    var buf: [512]u8 = undefined;
+    const url = try DiscordChannel.createThreadUrl(&buf, "999", "888");
+    try std.testing.expectEqualStrings("https://discord.com/api/v10/channels/999/messages/888/threads", url);
+}
+
+test "discord createThreadUrl buffer too small returns error" {
+    var buf: [10]u8 = undefined;
+    const result = DiscordChannel.createThreadUrl(&buf, "chan_123", "msg_456");
+    try std.testing.expect(if (result) |_| false else |_| true);
+}
+
+test "discord hasMessageReference detects thread message" {
+    const json =
+        \\{"content":"hello","message_reference":{"channel_id":"thread_1","message_id":"ref_1"}}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+    defer parsed.deinit();
+    try std.testing.expect(DiscordChannel.hasMessageReference(parsed.value.object));
+}
+
+test "discord hasMessageReference returns false for regular message" {
+    const json =
+        \\{"content":"hello","channel_id":"chan_1"}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+    defer parsed.deinit();
+    try std.testing.expect(!DiscordChannel.hasMessageReference(parsed.value.object));
+}
+
+test "discord getMessageReferenceChannelId extracts channel" {
+    const json =
+        \\{"content":"hello","message_reference":{"channel_id":"thread_42","message_id":"ref_1"}}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+    defer parsed.deinit();
+    const ref_chan = DiscordChannel.getMessageReferenceChannelId(parsed.value.object);
+    try std.testing.expectEqualStrings("thread_42", ref_chan.?);
+}
+
+test "discord getMessageReferenceChannelId returns null without reference" {
+    const json =
+        \\{"content":"hello"}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+    defer parsed.deinit();
+    try std.testing.expect(DiscordChannel.getMessageReferenceChannelId(parsed.value.object) == null);
+}
+
+test "discord getMessageReferenceChannelId returns null for non-object reference" {
+    const json =
+        \\{"content":"hello","message_reference":"not_an_object"}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+    defer parsed.deinit();
+    try std.testing.expect(DiscordChannel.getMessageReferenceChannelId(parsed.value.object) == null);
+}
+
+test "discord turn count increment and get" {
+    var ch = DiscordChannel.init(std.testing.allocator, "tok", null, false);
+    defer {
+        var it = ch.turn_counts.keyIterator();
+        while (it.next()) |key_ptr| ch.allocator.free(key_ptr.*);
+        ch.turn_counts.deinit(std.testing.allocator);
+    }
+
+    // Initially zero
+    try std.testing.expectEqual(@as(u32, 0), ch.getTurnCount("chan_1"));
+
+    // Increment
+    try std.testing.expectEqual(@as(u32, 1), ch.incrementTurnCount("chan_1"));
+    try std.testing.expectEqual(@as(u32, 1), ch.getTurnCount("chan_1"));
+
+    // Increment again
+    try std.testing.expectEqual(@as(u32, 2), ch.incrementTurnCount("chan_1"));
+    try std.testing.expectEqual(@as(u32, 2), ch.getTurnCount("chan_1"));
+}
+
+test "discord turn count reset" {
+    var ch = DiscordChannel.init(std.testing.allocator, "tok", null, false);
+    defer {
+        var it = ch.turn_counts.keyIterator();
+        while (it.next()) |key_ptr| ch.allocator.free(key_ptr.*);
+        ch.turn_counts.deinit(std.testing.allocator);
+    }
+
+    _ = ch.incrementTurnCount("chan_1");
+    _ = ch.incrementTurnCount("chan_1");
+    _ = ch.incrementTurnCount("chan_1");
+    try std.testing.expectEqual(@as(u32, 3), ch.getTurnCount("chan_1"));
+
+    ch.resetTurnCount("chan_1");
+    try std.testing.expectEqual(@as(u32, 0), ch.getTurnCount("chan_1"));
+}
+
+test "discord turn count per channel isolation" {
+    var ch = DiscordChannel.init(std.testing.allocator, "tok", null, false);
+    defer {
+        var it = ch.turn_counts.keyIterator();
+        while (it.next()) |key_ptr| ch.allocator.free(key_ptr.*);
+        ch.turn_counts.deinit(std.testing.allocator);
+    }
+
+    _ = ch.incrementTurnCount("chan_a");
+    _ = ch.incrementTurnCount("chan_a");
+    _ = ch.incrementTurnCount("chan_b");
+
+    try std.testing.expectEqual(@as(u32, 2), ch.getTurnCount("chan_a"));
+    try std.testing.expectEqual(@as(u32, 1), ch.getTurnCount("chan_b"));
+}
+
+test "discord turn count reset nonexistent is safe" {
+    var ch = DiscordChannel.init(std.testing.allocator, "tok", null, false);
+    defer ch.turn_counts.deinit(std.testing.allocator);
+
+    ch.resetTurnCount("nonexistent"); // should not crash
+}
+
+test "discord auto_thread_after defaults to disabled" {
+    const ch = DiscordChannel.init(std.testing.allocator, "tok", null, false);
+    try std.testing.expectEqual(@as(u32, 0), ch.auto_thread_after);
 }
