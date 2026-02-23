@@ -808,6 +808,9 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                             if (acc.get("guild_id")) |v| {
                                 if (v == .string) dc.guild_id = try self.allocator.dupe(u8, v.string);
                             }
+                            if (acc.get("application_id")) |v| {
+                                if (v == .string) dc.application_id = try self.allocator.dupe(u8, v.string);
+                            }
                             if (acc.get("allow_from")) |v| {
                                 if (v == .array) dc.allow_from = try parseStringArray(self.allocator, v.array);
                             }

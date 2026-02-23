@@ -145,6 +145,7 @@ pub const CronConfig = struct {
 pub const DiscordConfig = struct {
     token: []const u8,
     guild_id: ?[]const u8 = null,
+    application_id: ?[]const u8 = null,
     allow_bots: bool = false,
     allow_from: []const []const u8 = &.{},
     mention_only: bool = true,

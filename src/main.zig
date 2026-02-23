@@ -808,6 +808,7 @@ fn runDiscordChannelStart(allocator: std.mem.Allocator, args: []const []const u8
     discord.allow_from = allowed;
     discord.mention_only = discord_config.mention_only;
     discord.intents = discord_config.intents;
+    discord.application_id = discord_config.application_id;
 
     // Start gateway (spawns WebSocket + heartbeat threads)
     var ch = discord.channel();

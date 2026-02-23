@@ -158,6 +158,66 @@ pub fn curlGet(allocator: Allocator, url: []const u8, headers: []const []const u
     return curlGetWithProxy(allocator, url, headers, timeout_secs, null);
 }
 
+/// HTTP PUT with JSON body via curl subprocess.
+///
+/// Used for APIs that use PUT with a request body (e.g. Discord slash command registration).
+/// `headers` is a slice of header strings (e.g. `"Authorization: Bot xxx"`).
+/// Returns the response body. Caller owns returned memory.
+pub fn curlPut(allocator: Allocator, url: []const u8, body: []const u8, headers: []const []const u8) ![]u8 {
+    var argv_buf: [40][]const u8 = undefined;
+    var argc: usize = 0;
+
+    argv_buf[argc] = "curl";
+    argc += 1;
+    argv_buf[argc] = "-s";
+    argc += 1;
+    argv_buf[argc] = "-X";
+    argc += 1;
+    argv_buf[argc] = "PUT";
+    argc += 1;
+    argv_buf[argc] = "-H";
+    argc += 1;
+    argv_buf[argc] = "Content-Type: application/json";
+    argc += 1;
+
+    for (headers) |hdr| {
+        if (argc + 2 > argv_buf.len) break;
+        argv_buf[argc] = "-H";
+        argc += 1;
+        argv_buf[argc] = hdr;
+        argc += 1;
+    }
+
+    argv_buf[argc] = "-d";
+    argc += 1;
+    argv_buf[argc] = body;
+    argc += 1;
+    argv_buf[argc] = url;
+    argc += 1;
+
+    var child = std.process.Child.init(argv_buf[0..argc], allocator);
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Ignore;
+
+    try child.spawn();
+
+    const stdout = child.stdout.?.readToEndAlloc(allocator, 1024 * 1024) catch return error.CurlReadError;
+
+    const term = child.wait() catch return error.CurlWaitError;
+    switch (term) {
+        .Exited => |code| if (code != 0) {
+            allocator.free(stdout);
+            return error.CurlFailed;
+        },
+        else => {
+            allocator.free(stdout);
+            return error.CurlFailed;
+        },
+    }
+
+    return stdout;
+}
+
 /// HTTP PUT with empty body via curl subprocess.
 ///
 /// Used for APIs that use PUT with no request body (e.g. Discord reactions).

@@ -15,6 +15,7 @@ pub const DiscordChannel = struct {
     allow_bots: bool,
 
     // Optional gateway fields (have defaults so existing init works)
+    application_id: ?[]const u8 = null,
     allow_from: []const []const u8 = &.{},
     mention_only: bool = true,
     intents: u32 = 37377, // GUILDS|GUILD_MESSAGES|MESSAGE_CONTENT|DIRECT_MESSAGES
@@ -272,6 +273,334 @@ pub const DiscordChannel = struct {
         root.http_util.curlPutEmpty(self.allocator, url, &.{auth_header}) catch |err| {
             log.warn("Discord: failed to add reaction: {}", .{err});
         };
+    }
+
+    // ── Slash Commands ────────────────────────────────────────────────
+
+    /// Build the URL for bulk-overwriting global application commands.
+    /// PUT /applications/{app_id}/commands
+    pub fn bulkOverwriteUrl(buf: []u8, app_id: []const u8) ![]const u8 {
+        var fbs = std.io.fixedBufferStream(buf);
+        const w = fbs.writer();
+        try w.print("https://discord.com/api/v10/applications/{s}/commands", .{app_id});
+        return fbs.getWritten();
+    }
+
+    /// Build the URL for sending an interaction response.
+    /// POST /interactions/{interaction_id}/{interaction_token}/callback
+    pub fn interactionResponseUrl(buf: []u8, interaction_id: []const u8, interaction_token: []const u8) ![]const u8 {
+        var fbs = std.io.fixedBufferStream(buf);
+        const w = fbs.writer();
+        try w.print("https://discord.com/api/v10/interactions/{s}/{s}/callback", .{ interaction_id, interaction_token });
+        return fbs.getWritten();
+    }
+
+    /// Build the URL for sending a followup message.
+    /// POST /webhooks/{app_id}/{interaction_token}
+    pub fn followupUrl(buf: []u8, app_id: []const u8, interaction_token: []const u8) ![]const u8 {
+        var fbs = std.io.fixedBufferStream(buf);
+        const w = fbs.writer();
+        try w.print("https://discord.com/api/v10/webhooks/{s}/{s}", .{ app_id, interaction_token });
+        return fbs.getWritten();
+    }
+
+    /// JSON payload for registering all 4 slash commands via bulk overwrite.
+    pub const SLASH_COMMANDS_JSON =
+        \\[{"name":"ask","description":"Ask the bot a question","type":1,"options":[{"name":"prompt","description":"Your question or prompt","type":3,"required":true}]},
+        \\{"name":"remember","description":"Store a key-value pair in memory","type":1,"options":[{"name":"key","description":"Memory key","type":3,"required":true},{"name":"value","description":"Value to remember","type":3,"required":true}]},
+        \\{"name":"forget","description":"Remove a key from memory","type":1,"options":[{"name":"key","description":"Memory key to forget","type":3,"required":true}]},
+        \\{"name":"status","description":"Show bot status","type":1}]
+    ;
+
+    /// Register slash commands with Discord's bulk overwrite endpoint.
+    /// Requires application_id to be configured.
+    pub fn registerSlashCommands(self: *DiscordChannel) !void {
+        const app_id = self.application_id orelse return;
+
+        var url_buf: [256]u8 = undefined;
+        const url = try bulkOverwriteUrl(&url_buf, app_id);
+
+        var auth_buf: [512]u8 = undefined;
+        var auth_fbs = std.io.fixedBufferStream(&auth_buf);
+        try auth_fbs.writer().print("Authorization: Bot {s}", .{self.token});
+        const auth_header = auth_fbs.getWritten();
+
+        const resp = root.http_util.curlPut(self.allocator, url, SLASH_COMMANDS_JSON, &.{auth_header}) catch |err| {
+            log.err("Discord: failed to register slash commands: {}", .{err});
+            return error.DiscordApiError;
+        };
+        defer self.allocator.free(resp);
+
+        log.info("Discord: slash commands registered for app {s}", .{app_id});
+    }
+
+    /// Send an interaction response (type 4 = channel message, type 5 = deferred).
+    /// `resp_type` should be 4 for immediate response or 5 for deferred.
+    pub fn sendInteractionResponse(self: *DiscordChannel, interaction_id: []const u8, interaction_token: []const u8, resp_type: u8, content: ?[]const u8) !void {
+        var url_buf: [512]u8 = undefined;
+        const url = try interactionResponseUrl(&url_buf, interaction_id, interaction_token);
+
+        var body_list: std.ArrayListUnmanaged(u8) = .empty;
+        defer body_list.deinit(self.allocator);
+
+        if (content) |text| {
+            try body_list.appendSlice(self.allocator, "{\"type\":");
+            var type_buf: [4]u8 = undefined;
+            const type_str = try std.fmt.bufPrint(&type_buf, "{d}", .{resp_type});
+            try body_list.appendSlice(self.allocator, type_str);
+            try body_list.appendSlice(self.allocator, ",\"data\":{\"content\":");
+            try root.json_util.appendJsonString(&body_list, self.allocator, text);
+            try body_list.appendSlice(self.allocator, "}}");
+        } else {
+            // Deferred response (type 5) with no content
+            try body_list.appendSlice(self.allocator, "{\"type\":");
+            var type_buf: [4]u8 = undefined;
+            const type_str = try std.fmt.bufPrint(&type_buf, "{d}", .{resp_type});
+            try body_list.appendSlice(self.allocator, type_str);
+            try body_list.appendSlice(self.allocator, "}");
+        }
+
+        const resp = root.http_util.curlPost(self.allocator, url, body_list.items, &.{}) catch |err| {
+            log.err("Discord: interaction response failed: {}", .{err});
+            return error.DiscordApiError;
+        };
+        self.allocator.free(resp);
+    }
+
+    /// Send a followup message to an interaction.
+    pub fn sendFollowup(self: *DiscordChannel, interaction_token: []const u8, content: []const u8) !void {
+        const app_id = self.application_id orelse return error.NoApplicationId;
+
+        var url_buf: [512]u8 = undefined;
+        const url = try followupUrl(&url_buf, app_id, interaction_token);
+
+        var body_list: std.ArrayListUnmanaged(u8) = .empty;
+        defer body_list.deinit(self.allocator);
+
+        try body_list.appendSlice(self.allocator, "{\"content\":");
+        try root.json_util.appendJsonString(&body_list, self.allocator, content);
+        try body_list.appendSlice(self.allocator, "}");
+
+        var auth_buf: [512]u8 = undefined;
+        var auth_fbs = std.io.fixedBufferStream(&auth_buf);
+        try auth_fbs.writer().print("Authorization: Bot {s}", .{self.token});
+        const auth_header = auth_fbs.getWritten();
+
+        const resp = root.http_util.curlPost(self.allocator, url, body_list.items, &.{auth_header}) catch |err| {
+            log.err("Discord: followup message failed: {}", .{err});
+            return error.DiscordApiError;
+        };
+        self.allocator.free(resp);
+    }
+
+    /// Build JSON for an interaction response of a given type with optional content.
+    /// Returns a slice into the provided buffer.
+    pub fn buildInteractionResponseJson(buf: []u8, resp_type: u8, content: ?[]const u8) ![]const u8 {
+        var fbs = std.io.fixedBufferStream(buf);
+        const w = fbs.writer();
+        if (content) |text| {
+            try w.print("{{\"type\":{d},\"data\":{{\"content\":\"{s}\"}}}}", .{ resp_type, text });
+        } else {
+            try w.print("{{\"type\":{d}}}", .{resp_type});
+        }
+        return fbs.getWritten();
+    }
+
+    /// Parse an INTERACTION_CREATE event and extract command details.
+    /// Returns command name, interaction id, interaction token, channel_id, and user id.
+    pub const InteractionInfo = struct {
+        command_name: []const u8,
+        interaction_id: []const u8,
+        interaction_token: []const u8,
+        channel_id: []const u8,
+        user_id: []const u8,
+        guild_id: ?[]const u8,
+    };
+
+    /// Extract an option value by name from interaction data options array.
+    pub fn getInteractionOption(d_obj: std.json.ObjectMap, option_name: []const u8) ?[]const u8 {
+        const data_val = d_obj.get("data") orelse return null;
+        const data_obj = switch (data_val) {
+            .object => |o| o,
+            else => return null,
+        };
+        const options_val = data_obj.get("options") orelse return null;
+        const options_arr = switch (options_val) {
+            .array => |a| a,
+            else => return null,
+        };
+        for (options_arr.items) |opt_val| {
+            const opt_obj = switch (opt_val) {
+                .object => |o| o,
+                else => continue,
+            };
+            const name_val = opt_obj.get("name") orelse continue;
+            const name_str = switch (name_val) {
+                .string => |s| s,
+                else => continue,
+            };
+            if (std.mem.eql(u8, name_str, option_name)) {
+                const value_val = opt_obj.get("value") orelse return null;
+                return switch (value_val) {
+                    .string => |s| s,
+                    else => null,
+                };
+            }
+        }
+        return null;
+    }
+
+    /// Parse INTERACTION_CREATE event "d" object into InteractionInfo.
+    pub fn parseInteraction(d_obj: std.json.ObjectMap) ?InteractionInfo {
+        // type must be 2 (APPLICATION_COMMAND)
+        const type_val = d_obj.get("type") orelse return null;
+        const interaction_type: i64 = switch (type_val) {
+            .integer => |i| i,
+            else => return null,
+        };
+        if (interaction_type != 2) return null;
+
+        const id_val = d_obj.get("id") orelse return null;
+        const interaction_id: []const u8 = switch (id_val) {
+            .string => |s| s,
+            else => return null,
+        };
+
+        const token_val = d_obj.get("token") orelse return null;
+        const interaction_token: []const u8 = switch (token_val) {
+            .string => |s| s,
+            else => return null,
+        };
+
+        const channel_val = d_obj.get("channel_id") orelse return null;
+        const channel_id: []const u8 = switch (channel_val) {
+            .string => |s| s,
+            else => return null,
+        };
+
+        // Extract command name from data.name
+        const data_val = d_obj.get("data") orelse return null;
+        const data_obj = switch (data_val) {
+            .object => |o| o,
+            else => return null,
+        };
+        const name_val = data_obj.get("name") orelse return null;
+        const command_name: []const u8 = switch (name_val) {
+            .string => |s| s,
+            else => return null,
+        };
+
+        // Extract user id from member.user.id (guild) or user.id (DM)
+        const user_id: []const u8 = blk: {
+            if (d_obj.get("member")) |member_val| {
+                const member_obj = switch (member_val) {
+                    .object => |o| o,
+                    else => break :blk "",
+                };
+                const user_val = member_obj.get("user") orelse break :blk "";
+                const user_obj = switch (user_val) {
+                    .object => |o| o,
+                    else => break :blk "",
+                };
+                const uid_val = user_obj.get("id") orelse break :blk "";
+                break :blk switch (uid_val) {
+                    .string => |s| s,
+                    else => "",
+                };
+            } else if (d_obj.get("user")) |user_val| {
+                const user_obj = switch (user_val) {
+                    .object => |o| o,
+                    else => break :blk "",
+                };
+                const uid_val = user_obj.get("id") orelse break :blk "";
+                break :blk switch (uid_val) {
+                    .string => |s| s,
+                    else => "",
+                };
+            } else break :blk "";
+        };
+
+        const guild_id: ?[]const u8 = if (d_obj.get("guild_id")) |v| switch (v) {
+            .string => |s| s,
+            else => null,
+        } else null;
+
+        return .{
+            .command_name = command_name,
+            .interaction_id = interaction_id,
+            .interaction_token = interaction_token,
+            .channel_id = channel_id,
+            .user_id = user_id,
+            .guild_id = guild_id,
+        };
+    }
+
+    /// Handle INTERACTION_CREATE event: parse, send deferred response, and publish to bus.
+    fn handleInteractionCreate(self: *DiscordChannel, root_val: std.json.Value) !void {
+        const d_val = root_val.object.get("d") orelse return;
+        const d_obj = switch (d_val) {
+            .object => |o| o,
+            else => return,
+        };
+
+        const info = parseInteraction(d_obj) orelse return;
+
+        // Build content string from command + options
+        var content_buf: [2048]u8 = undefined;
+        var content_fbs = std.io.fixedBufferStream(&content_buf);
+        const cw = content_fbs.writer();
+
+        if (std.mem.eql(u8, info.command_name, "ask")) {
+            const prompt = getInteractionOption(d_obj, "prompt") orelse "help";
+            cw.print("/{s} {s}", .{ info.command_name, prompt }) catch return;
+        } else if (std.mem.eql(u8, info.command_name, "remember")) {
+            const key = getInteractionOption(d_obj, "key") orelse "";
+            const value = getInteractionOption(d_obj, "value") orelse "";
+            cw.print("/{s} {s} {s}", .{ info.command_name, key, value }) catch return;
+        } else if (std.mem.eql(u8, info.command_name, "forget")) {
+            const key = getInteractionOption(d_obj, "key") orelse "";
+            cw.print("/{s} {s}", .{ info.command_name, key }) catch return;
+        } else if (std.mem.eql(u8, info.command_name, "status")) {
+            cw.print("/{s}", .{info.command_name}) catch return;
+        } else {
+            return; // Unknown command
+        }
+        const content = content_fbs.getWritten();
+
+        // Send deferred response (type 5) so user sees "thinking..."
+        self.sendInteractionResponse(info.interaction_id, info.interaction_token, 5, null) catch |err| {
+            log.warn("Discord: failed to send deferred response: {}", .{err});
+        };
+
+        // Build session_key and metadata, publish to bus
+        const session_key = std.fmt.allocPrint(self.allocator, "discord:{s}", .{info.channel_id}) catch return;
+        defer self.allocator.free(session_key);
+
+        // Metadata includes interaction token for followup responses
+        var meta_buf: [512]u8 = undefined;
+        var meta_fbs = std.io.fixedBufferStream(&meta_buf);
+        meta_fbs.writer().print("{{\"interaction_token\":\"{s}\",\"command\":\"{s}\"}}", .{ info.interaction_token, info.command_name }) catch return;
+        const metadata_json: ?[]const u8 = if (meta_fbs.pos > 0) meta_fbs.getWritten() else null;
+
+        const msg = bus_mod.makeInboundFull(
+            self.allocator,
+            "discord",
+            info.user_id,
+            info.channel_id,
+            content,
+            session_key,
+            &.{},
+            metadata_json,
+        ) catch return;
+
+        if (self.bus) |b| {
+            b.publishInbound(msg) catch |err| {
+                log.warn("Discord: failed to publish interaction message: {}", .{err});
+                msg.deinit(self.allocator);
+            };
+        } else {
+            msg.deinit(self.allocator);
+        }
     }
 
     // ── Conversation mode ───────────────────────────────────────────
@@ -549,6 +878,16 @@ pub const DiscordChannel = struct {
                 if (std.mem.eql(u8, event_type, "READY")) {
                     self.handleReady(root_val) catch |err| {
                         log.warn("Discord: handleReady error: {}", .{err});
+                    };
+                    // Register slash commands after READY if application_id is set
+                    if (self.application_id != null) {
+                        self.registerSlashCommands() catch |err| {
+                            log.warn("Discord: slash command registration failed: {}", .{err});
+                        };
+                    }
+                } else if (std.mem.eql(u8, event_type, "INTERACTION_CREATE")) {
+                    self.handleInteractionCreate(root_val) catch |err| {
+                        log.warn("Discord: handleInteractionCreate error: {}", .{err});
                     };
                 } else if (std.mem.eql(u8, event_type, "MESSAGE_CREATE")) {
                     self.handleMessageCreate(root_val) catch |err| {
@@ -1001,4 +1340,182 @@ test "discord conversation mode clear nonexistent is safe" {
 
     // Should not crash
     ch.clearConversationMode("nonexistent");
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Slash Command and Interaction Tests
+// ════════════════════════════════════════════════════════════════════════════
+
+test "discord bulkOverwriteUrl" {
+    var buf: [256]u8 = undefined;
+    const url = try DiscordChannel.bulkOverwriteUrl(&buf, "123456789");
+    try std.testing.expectEqualStrings("https://discord.com/api/v10/applications/123456789/commands", url);
+}
+
+test "discord interactionResponseUrl" {
+    var buf: [512]u8 = undefined;
+    const url = try DiscordChannel.interactionResponseUrl(&buf, "inter_123", "token_abc");
+    try std.testing.expectEqualStrings("https://discord.com/api/v10/interactions/inter_123/token_abc/callback", url);
+}
+
+test "discord followupUrl" {
+    var buf: [512]u8 = undefined;
+    const url = try DiscordChannel.followupUrl(&buf, "app_123", "token_abc");
+    try std.testing.expectEqualStrings("https://discord.com/api/v10/webhooks/app_123/token_abc", url);
+}
+
+test "discord buildInteractionResponseJson deferred" {
+    var buf: [256]u8 = undefined;
+    const json = try DiscordChannel.buildInteractionResponseJson(&buf, 5, null);
+    try std.testing.expectEqualStrings("{\"type\":5}", json);
+}
+
+test "discord buildInteractionResponseJson with content" {
+    var buf: [256]u8 = undefined;
+    const json = try DiscordChannel.buildInteractionResponseJson(&buf, 4, "hello world");
+    try std.testing.expectEqualStrings("{\"type\":4,\"data\":{\"content\":\"hello world\"}}", json);
+}
+
+test "discord application_id defaults to null" {
+    const ch = DiscordChannel.init(std.testing.allocator, "tok", null, false);
+    try std.testing.expect(ch.application_id == null);
+}
+
+test "discord application_id can be set" {
+    var ch = DiscordChannel.init(std.testing.allocator, "tok", null, false);
+    ch.application_id = "app_12345";
+    try std.testing.expectEqualStrings("app_12345", ch.application_id.?);
+}
+
+test "discord SLASH_COMMANDS_JSON is valid json" {
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, DiscordChannel.SLASH_COMMANDS_JSON, .{});
+    defer parsed.deinit();
+    // Should be an array of 4 commands
+    try std.testing.expect(parsed.value == .array);
+    try std.testing.expectEqual(@as(usize, 4), parsed.value.array.items.len);
+
+    // Verify command names
+    const commands = parsed.value.array.items;
+    const name0 = commands[0].object.get("name").?.string;
+    try std.testing.expectEqualStrings("ask", name0);
+    const name1 = commands[1].object.get("name").?.string;
+    try std.testing.expectEqualStrings("remember", name1);
+    const name2 = commands[2].object.get("name").?.string;
+    try std.testing.expectEqualStrings("forget", name2);
+    const name3 = commands[3].object.get("name").?.string;
+    try std.testing.expectEqualStrings("status", name3);
+}
+
+test "discord parseInteraction valid ask command" {
+    const json =
+        \\{"type":2,"id":"inter_1","token":"tok_abc","channel_id":"chan_1",
+        \\"data":{"name":"ask","options":[{"name":"prompt","value":"hello?","type":3}]},
+        \\"member":{"user":{"id":"user_42"}},"guild_id":"guild_1"}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+    defer parsed.deinit();
+    const info = DiscordChannel.parseInteraction(parsed.value.object).?;
+    try std.testing.expectEqualStrings("ask", info.command_name);
+    try std.testing.expectEqualStrings("inter_1", info.interaction_id);
+    try std.testing.expectEqualStrings("tok_abc", info.interaction_token);
+    try std.testing.expectEqualStrings("chan_1", info.channel_id);
+    try std.testing.expectEqualStrings("user_42", info.user_id);
+    try std.testing.expectEqualStrings("guild_1", info.guild_id.?);
+}
+
+test "discord parseInteraction DM user fallback" {
+    const json =
+        \\{"type":2,"id":"inter_2","token":"tok_def","channel_id":"dm_1",
+        \\"data":{"name":"status"},"user":{"id":"user_99"}}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+    defer parsed.deinit();
+    const info = DiscordChannel.parseInteraction(parsed.value.object).?;
+    try std.testing.expectEqualStrings("status", info.command_name);
+    try std.testing.expectEqualStrings("user_99", info.user_id);
+    try std.testing.expect(info.guild_id == null);
+}
+
+test "discord parseInteraction rejects non-command type" {
+    const json =
+        \\{"type":1,"id":"inter_3","token":"tok_ghi","channel_id":"chan_2",
+        \\"data":{"name":"ping"}}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+    defer parsed.deinit();
+    try std.testing.expect(DiscordChannel.parseInteraction(parsed.value.object) == null);
+}
+
+test "discord parseInteraction missing data returns null" {
+    const json =
+        \\{"type":2,"id":"inter_4","token":"tok_jkl","channel_id":"chan_3"}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+    defer parsed.deinit();
+    try std.testing.expect(DiscordChannel.parseInteraction(parsed.value.object) == null);
+}
+
+test "discord getInteractionOption extracts value" {
+    const json =
+        \\{"data":{"name":"ask","options":[{"name":"prompt","value":"what is 2+2?","type":3}]}}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+    defer parsed.deinit();
+    const val = DiscordChannel.getInteractionOption(parsed.value.object, "prompt");
+    try std.testing.expectEqualStrings("what is 2+2?", val.?);
+}
+
+test "discord getInteractionOption missing option returns null" {
+    const json =
+        \\{"data":{"name":"ask","options":[{"name":"prompt","value":"hello","type":3}]}}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+    defer parsed.deinit();
+    try std.testing.expect(DiscordChannel.getInteractionOption(parsed.value.object, "nonexistent") == null);
+}
+
+test "discord getInteractionOption no options array returns null" {
+    const json =
+        \\{"data":{"name":"status"}}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+    defer parsed.deinit();
+    try std.testing.expect(DiscordChannel.getInteractionOption(parsed.value.object, "key") == null);
+}
+
+test "discord getInteractionOption remember command two options" {
+    const json =
+        \\{"data":{"name":"remember","options":[{"name":"key","value":"foo","type":3},{"name":"value","value":"bar","type":3}]}}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("foo", DiscordChannel.getInteractionOption(parsed.value.object, "key").?);
+    try std.testing.expectEqualStrings("bar", DiscordChannel.getInteractionOption(parsed.value.object, "value").?);
+}
+
+test "discord SLASH_COMMANDS_JSON ask has required prompt option" {
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, DiscordChannel.SLASH_COMMANDS_JSON, .{});
+    defer parsed.deinit();
+    const ask_cmd = parsed.value.array.items[0].object;
+    const options = ask_cmd.get("options").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), options.len);
+    try std.testing.expectEqualStrings("prompt", options[0].object.get("name").?.string);
+    try std.testing.expect(options[0].object.get("required").?.bool);
+}
+
+test "discord SLASH_COMMANDS_JSON remember has two required options" {
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, DiscordChannel.SLASH_COMMANDS_JSON, .{});
+    defer parsed.deinit();
+    const remember_cmd = parsed.value.array.items[1].object;
+    const options = remember_cmd.get("options").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), options.len);
+    try std.testing.expectEqualStrings("key", options[0].object.get("name").?.string);
+    try std.testing.expectEqualStrings("value", options[1].object.get("name").?.string);
+}
+
+test "discord SLASH_COMMANDS_JSON status has no options" {
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, DiscordChannel.SLASH_COMMANDS_JSON, .{});
+    defer parsed.deinit();
+    const status_cmd = parsed.value.array.items[3].object;
+    try std.testing.expect(status_cmd.get("options") == null);
 }
