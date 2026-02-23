@@ -225,14 +225,79 @@ pub const GatewayState = struct {
     }
 };
 
-/// Check if all registered health components are OK.
-fn isHealthOk() bool {
+/// Health response — encapsulates HTTP status and body for /health.
+pub const HealthResponse = struct {
+    http_status: []const u8,
+    body: []const u8,
+    /// Whether body was allocated and should be freed by caller.
+    allocated: bool,
+};
+
+/// Handle the /health endpoint logic. Queries the global health registry
+/// and returns component-level JSON with HTTP 200 (all ok) or 503 (any down).
+pub fn handleHealth(allocator: std.mem.Allocator) HealthResponse {
     const snap = health.snapshot();
+    var all_ok = true;
+
+    // Build JSON: {"status":"ok|degraded","uptime":N,"components":{...}}
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+
+    // Write components object
+    w.writeAll("{\"status\":\"") catch return errorHealthResponse();
+    // Defer writing status until we know if all ok — write a placeholder
+    const status_pos = buf.items.len;
+    // Reserve space: "ok" (2) or "degraded" (8); use "degraded" as max and trim later
+    w.writeAll("degraded") catch return errorHealthResponse();
+    const after_status_pos = buf.items.len;
+
+    w.print("\",\"uptime\":{d},\"components\":{{", .{snap.uptime_seconds}) catch return errorHealthResponse();
+
     var iter = snap.components.iterator();
+    var first = true;
     while (iter.next()) |entry| {
-        if (!std.mem.eql(u8, entry.value_ptr.status, "ok")) return false;
+        if (!first) w.writeByte(',') catch return errorHealthResponse();
+        first = false;
+        const status = entry.value_ptr.status;
+        if (!std.mem.eql(u8, status, "ok")) all_ok = false;
+        w.print("\"{s}\":\"{s}\"", .{ entry.key_ptr.*, status }) catch return errorHealthResponse();
     }
-    return true;
+
+    w.writeAll("}}") catch return errorHealthResponse();
+
+    // Patch status in-place
+    if (all_ok) {
+        // Replace "degraded" (8 bytes) with "ok" + 6 bytes we need to shift
+        // Simpler: rebuild with correct status since we have everything
+        var result_buf: std.ArrayList(u8) = .empty;
+        defer result_buf.deinit(allocator);
+        const rw = result_buf.writer(allocator);
+        rw.writeAll(buf.items[0..status_pos]) catch return errorHealthResponse();
+        rw.writeAll("ok") catch return errorHealthResponse();
+        rw.writeAll(buf.items[after_status_pos..]) catch return errorHealthResponse();
+        const body = allocator.dupe(u8, result_buf.items) catch return errorHealthResponse();
+        return .{
+            .http_status = "200 OK",
+            .body = body,
+            .allocated = true,
+        };
+    }
+
+    const body = allocator.dupe(u8, buf.items) catch return errorHealthResponse();
+    return .{
+        .http_status = "503 Service Unavailable",
+        .body = body,
+        .allocated = true,
+    };
+}
+
+fn errorHealthResponse() HealthResponse {
+    return .{
+        .http_status = "500 Internal Server Error",
+        .body = "{\"status\":\"degraded\",\"uptime\":0,\"components\":{}}",
+        .allocated = false,
+    };
 }
 
 /// Readiness response — encapsulates HTTP status and body for /ready.
@@ -598,7 +663,9 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16) !void {
 
         if (route_map.get(base_path)) |route| switch (route) {
             .health => {
-                response_body = if (isHealthOk()) "{\"status\":\"ok\"}" else "{\"status\":\"degraded\"}";
+                const health_resp = handleHealth(req_allocator);
+                response_body = health_resp.body;
+                response_status = health_resp.http_status;
             },
             .ready => {
                 const readiness = health.checkRegistryReadiness(req_allocator) catch {
@@ -1269,4 +1336,87 @@ test "handleReady session_mgr recovery transitions to ready" {
     const resp2 = handleReady(std.testing.allocator);
     defer if (resp2.allocated) std.testing.allocator.free(@constCast(resp2.body));
     try std.testing.expectEqualStrings("200 OK", resp2.http_status);
+}
+
+// ── /health endpoint tests (component-level) ─────────────────────────
+
+test "handleHealth all components ok returns 200" {
+    health.reset();
+    health.markComponentOk("gateway");
+    health.markComponentOk("memory");
+    const resp = handleHealth(std.testing.allocator);
+    defer if (resp.allocated) std.testing.allocator.free(@constCast(resp.body));
+    try std.testing.expectEqualStrings("200 OK", resp.http_status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"status\":\"ok\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"components\":{") != null);
+}
+
+test "handleHealth degraded component returns 503" {
+    health.reset();
+    health.markComponentOk("gateway");
+    health.markComponentError("memory", "backend unreachable");
+    const resp = handleHealth(std.testing.allocator);
+    defer if (resp.allocated) std.testing.allocator.free(@constCast(resp.body));
+    try std.testing.expectEqualStrings("503 Service Unavailable", resp.http_status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"status\":\"degraded\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"memory\":\"error\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"gateway\":\"ok\"") != null);
+}
+
+test "handleHealth no components returns 200 ok" {
+    health.reset();
+    const resp = handleHealth(std.testing.allocator);
+    defer if (resp.allocated) std.testing.allocator.free(@constCast(resp.body));
+    try std.testing.expectEqualStrings("200 OK", resp.http_status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"status\":\"ok\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"components\":{}") != null);
+}
+
+test "handleHealth includes uptime field" {
+    health.reset();
+    health.markComponentOk("test-svc");
+    const resp = handleHealth(std.testing.allocator);
+    defer if (resp.allocated) std.testing.allocator.free(@constCast(resp.body));
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"uptime\":") != null);
+}
+
+test "handleHealth response body is valid JSON structure" {
+    health.reset();
+    health.markComponentOk("gateway");
+    const resp = handleHealth(std.testing.allocator);
+    defer if (resp.allocated) std.testing.allocator.free(@constCast(resp.body));
+    try std.testing.expect(resp.body.len > 0);
+    try std.testing.expectEqual(@as(u8, '{'), resp.body[0]);
+    try std.testing.expectEqual(@as(u8, '}'), resp.body[resp.body.len - 1]);
+}
+
+test "handleHealth multiple unhealthy components returns 503" {
+    health.reset();
+    health.markComponentError("memory", "disk full");
+    health.markComponentError("provider", "api key expired");
+    const resp = handleHealth(std.testing.allocator);
+    defer if (resp.allocated) std.testing.allocator.free(@constCast(resp.body));
+    try std.testing.expectEqualStrings("503 Service Unavailable", resp.http_status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"status\":\"degraded\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"memory\":\"error\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"provider\":\"error\"") != null);
+}
+
+test "handleHealth recovered component shows ok" {
+    health.reset();
+    health.markComponentError("db", "down");
+    health.markComponentOk("db");
+    const resp = handleHealth(std.testing.allocator);
+    defer if (resp.allocated) std.testing.allocator.free(@constCast(resp.body));
+    try std.testing.expectEqualStrings("200 OK", resp.http_status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"db\":\"ok\"") != null);
+}
+
+test "handleHealth single component ok" {
+    health.reset();
+    health.markComponentOk("provider");
+    const resp = handleHealth(std.testing.allocator);
+    defer if (resp.allocated) std.testing.allocator.free(@constCast(resp.body));
+    try std.testing.expectEqualStrings("200 OK", resp.http_status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"provider\":\"ok\"") != null);
 }
