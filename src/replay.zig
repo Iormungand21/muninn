@@ -1,14 +1,14 @@
-//! Replay mode skeleton and budget metrics summary.
+//! Replay mode: JSONL event parsing, stats computation, and budget metrics.
 //!
-//! Provides types and stubs for replaying event timelines from JSONL files
-//! and summarizing cost/latency budgets for diagnostics output.
-//! Full event parsing is stubbed with TODO boundaries for future work.
+//! Provides types and logic for replaying event timelines from JSONL files,
+//! computing session statistics, and summarizing cost/latency budgets.
 
 const std = @import("std");
 const events = @import("events.zig");
 const EventRecord = events.EventRecord;
 const EventKind = events.EventKind;
 const EventSeverity = events.EventSeverity;
+const events_store = @import("events_store.zig");
 const cost_mod = @import("cost.zig");
 
 // ── Replay types ──────────────────────────────────────────────────
@@ -58,7 +58,6 @@ pub const ReplaySession = struct {
     position: ReplayPosition = .{},
 
     /// Advance the replay by one event.
-    /// TODO(S3-OBS): Full implementation would process the event and update state.
     pub fn step(self: *ReplaySession) ?*const EventRecord {
         if (self.position.index >= self.events.len) {
             self.position.finished = true;
@@ -186,18 +185,150 @@ pub const BudgetSummary = struct {
     }
 };
 
-// ── Replay loader (skeleton) ──────────────────────────────────────
+// ── Event deserialization ─────────────────────────────────────────
+
+/// Deserialize a single JSON line into an EventRecord.
+/// All string fields are duped into the provided allocator.
+pub fn deserializeEvent(allocator: std.mem.Allocator, line: []const u8) !EventRecord {
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+    defer parsed.deinit();
+
+    const obj = switch (parsed.value) {
+        .object => |o| o,
+        else => return error.InvalidFormat,
+    };
+
+    const id_str = switch (obj.get("id") orelse return error.MissingField) {
+        .string => |s| s,
+        else => return error.InvalidFormat,
+    };
+    const kind_str = switch (obj.get("kind") orelse return error.MissingField) {
+        .string => |s| s,
+        else => return error.InvalidFormat,
+    };
+    const ts_str = switch (obj.get("timestamp") orelse return error.MissingField) {
+        .string => |s| s,
+        else => return error.InvalidFormat,
+    };
+
+    const kind = EventKind.fromString(kind_str) orelse return error.InvalidFormat;
+
+    var severity: EventSeverity = .info;
+    if (obj.get("severity")) |sev_val| {
+        const sev_str = switch (sev_val) {
+            .string => |s| s,
+            else => return error.InvalidFormat,
+        };
+        severity = EventSeverity.fromString(sev_str) orelse return error.InvalidFormat;
+    }
+
+    var duration_ns: u64 = 0;
+    if (obj.get("duration_ns")) |dur_val| {
+        duration_ns = switch (dur_val) {
+            .integer => |i| @intCast(i),
+            else => return error.InvalidFormat,
+        };
+    }
+
+    const correlation = events.EventCorrelation{
+        .session_id = if (obj.get("session_id")) |v| try dupeJsonStr(allocator, v) else null,
+        .task_id = if (obj.get("task_id")) |v| try dupeJsonStr(allocator, v) else null,
+        .step_name = if (obj.get("step_name")) |v| try dupeJsonStr(allocator, v) else null,
+        .parent_event_id = if (obj.get("parent_event_id")) |v| try dupeJsonStr(allocator, v) else null,
+        .channel = if (obj.get("channel")) |v| try dupeJsonStr(allocator, v) else null,
+    };
+
+    return .{
+        .id = try allocator.dupe(u8, id_str),
+        .kind = kind,
+        .severity = severity,
+        .timestamp = try allocator.dupe(u8, ts_str),
+        .correlation = correlation,
+        .duration_ns = duration_ns,
+        .summary = if (obj.get("summary")) |v| try dupeJsonStr(allocator, v) else null,
+        .detail = if (obj.get("detail")) |v| try dupeJsonStr(allocator, v) else null,
+        .source = if (obj.get("source")) |v| try dupeJsonStr(allocator, v) else null,
+    };
+}
+
+fn dupeJsonStr(allocator: std.mem.Allocator, val: std.json.Value) ![]const u8 {
+    return switch (val) {
+        .string => |s| try allocator.dupe(u8, s),
+        else => error.InvalidFormat,
+    };
+}
+
+// ── Event loading ────────────────────────────────────────────────
+
+/// Load events from JSONL content (one JSON object per line).
+/// Returns an owned slice of EventRecords; caller must free each
+/// record with record.deinit(allocator) and the slice itself.
+pub fn loadEvents(allocator: std.mem.Allocator, content: []const u8) ![]EventRecord {
+    var list: std.ArrayListUnmanaged(EventRecord) = .empty;
+    errdefer {
+        for (list.items) |*rec| rec.deinit(allocator);
+        list.deinit(allocator);
+    }
+
+    var it = std.mem.splitScalar(u8, content, '\n');
+    while (it.next()) |line| {
+        if (line.len == 0) continue;
+        const rec = try deserializeEvent(allocator, line);
+        try list.append(allocator, rec);
+    }
+
+    return list.toOwnedSlice(allocator);
+}
+
+// ── Event processing ─────────────────────────────────────────────
+
+/// Update a SessionSummary by processing a single event.
+pub fn processEvent(summary: *SessionSummary, record: *const EventRecord) void {
+    summary.event_count += 1;
+
+    // Severity counters
+    if (record.severity == .err) summary.error_count += 1;
+    if (record.severity == .warn) summary.warning_count += 1;
+
+    // Kind counters
+    if (record.kind == .tool_call) summary.tool_call_count += 1;
+    if (record.kind == .llm_request) summary.llm_request_count += 1;
+
+    // Duration accumulation
+    summary.total_duration_ns += record.duration_ns;
+
+    // Timestamp tracking
+    if (summary.first_timestamp == null) {
+        summary.first_timestamp = record.timestamp;
+    }
+    summary.last_timestamp = record.timestamp;
+}
+
+/// Compute a SessionSummary from a slice of events.
+pub fn computeStats(session_id: []const u8, event_list: []const EventRecord) SessionSummary {
+    var summary = SessionSummary{ .session_id = session_id };
+    for (event_list) |*rec| {
+        processEvent(&summary, rec);
+    }
+    return summary;
+}
+
+// ── Replay loader ────────────────────────────────────────────────
 
 /// Load a replay session from a JSONL event file.
-/// TODO(S3-OBS): Parse JSONL file line by line, deserialize each EventRecord,
-/// and build the event list. Current skeleton returns an empty session.
-pub fn loadReplaySession(session_id: []const u8, _path: []const u8) ReplaySession {
-    _ = _path;
-    // TODO(S3-OBS): Parse JSONL event file and populate events list.
-    // Skeleton returns an empty session so callers can be wired up now.
+/// Reads the file, parses each line into an EventRecord, and computes stats.
+/// Returns an error if the file cannot be read or parsed.
+pub fn loadReplaySession(allocator: std.mem.Allocator, session_id: []const u8, path: []const u8) !ReplaySession {
+    const content = try std.fs.cwd().readFileAlloc(allocator, path, 10 * 1024 * 1024);
+    defer allocator.free(content);
+
+    const loaded = try loadEvents(allocator, content);
+    const summary = computeStats(session_id, loaded);
+
     return .{
         .session_id = session_id,
-        .summary = .{ .session_id = session_id },
+        .events = loaded,
+        .summary = summary,
     };
 }
 
@@ -230,8 +361,8 @@ pub fn buildBudgetSummary(tracker: *const cost_mod.CostTracker) BudgetSummary {
     };
 }
 
-/// Build a session summary from event counts.
-/// TODO(S3-OBS): Accept a slice of EventRecord and compute from actual events.
+/// Build a session summary from pre-computed event counts.
+/// For computing stats from actual events, use computeStats() instead.
 pub fn summarizeSession(
     session_id: []const u8,
     event_count: usize,
@@ -445,11 +576,30 @@ test "BudgetSummary formatStatus exceeded" {
     try std.testing.expect(std.mem.startsWith(u8, line, "budget: EXCEEDED"));
 }
 
-test "loadReplaySession returns empty skeleton" {
-    const session = loadReplaySession("sess-001", "/tmp/events.jsonl");
+test "loadReplaySession with file" {
+    const allocator = std.testing.allocator;
+    const test_path = "/tmp/nullclaw_replay_load_test.jsonl";
+
+    // Write sample JSONL
+    {
+        const file = try std.fs.cwd().createFile(test_path, .{});
+        defer file.close();
+        try file.writeAll(
+            \\{"id":"e1","kind":"agent_start","severity":"info","timestamp":"2026-01-01T00:00:00Z"}
+            \\{"id":"e2","kind":"tool_call","severity":"info","timestamp":"2026-01-01T00:00:01Z","duration_ns":100000000}
+            \\
+        );
+    }
+    defer std.fs.cwd().deleteFile(test_path) catch {};
+
+    const session = try loadReplaySession(allocator, "sess-001", test_path);
+    defer allocator.free(session.events);
+    defer for (session.events) |*e| e.deinit(allocator);
+
     try std.testing.expectEqualStrings("sess-001", session.session_id);
-    try std.testing.expectEqual(@as(usize, 0), session.events.len);
-    try std.testing.expectEqualStrings("sess-001", session.summary.session_id);
+    try std.testing.expectEqual(@as(usize, 2), session.events.len);
+    try std.testing.expectEqual(@as(usize, 2), session.summary.event_count);
+    try std.testing.expectEqual(@as(usize, 1), session.summary.tool_call_count);
     try std.testing.expect(!session.position.finished);
 }
 
@@ -509,4 +659,201 @@ test "summarizeSession builds correct summary" {
     try std.testing.expect(s.hasErrors());
     try std.testing.expect(s.hasIssues());
     try std.testing.expectEqual(@as(u64, 5000), s.durationMs());
+}
+
+test "deserializeEvent minimal" {
+    const allocator = std.testing.allocator;
+    const line = "{\"id\":\"e1\",\"kind\":\"system\",\"severity\":\"info\",\"timestamp\":\"2026-01-01T00:00:00Z\"}";
+    const rec = try deserializeEvent(allocator, line);
+    defer rec.deinit(allocator);
+
+    try std.testing.expectEqualStrings("e1", rec.id);
+    try std.testing.expect(rec.kind == .system);
+    try std.testing.expect(rec.severity == .info);
+    try std.testing.expectEqualStrings("2026-01-01T00:00:00Z", rec.timestamp);
+    try std.testing.expectEqual(@as(u64, 0), rec.duration_ns);
+    try std.testing.expect(rec.summary == null);
+    try std.testing.expect(rec.correlation.session_id == null);
+}
+
+test "deserializeEvent full fields" {
+    const allocator = std.testing.allocator;
+    const line =
+        \\{"id":"e2","kind":"tool_call","severity":"debug","timestamp":"2026-02-01T12:00:00Z","duration_ns":500000000,"session_id":"s1","task_id":"t1","step_name":"step1","parent_event_id":"e0","channel":"cli","source":"tools.shell","summary":"ran ls","detail":"ls -la"}
+    ;
+    const rec = try deserializeEvent(allocator, line);
+    defer rec.deinit(allocator);
+
+    try std.testing.expectEqualStrings("e2", rec.id);
+    try std.testing.expect(rec.kind == .tool_call);
+    try std.testing.expect(rec.severity == .debug);
+    try std.testing.expectEqual(@as(u64, 500_000_000), rec.duration_ns);
+    try std.testing.expectEqualStrings("s1", rec.correlation.session_id.?);
+    try std.testing.expectEqualStrings("t1", rec.correlation.task_id.?);
+    try std.testing.expectEqualStrings("step1", rec.correlation.step_name.?);
+    try std.testing.expectEqualStrings("e0", rec.correlation.parent_event_id.?);
+    try std.testing.expectEqualStrings("cli", rec.correlation.channel.?);
+    try std.testing.expectEqualStrings("tools.shell", rec.source.?);
+    try std.testing.expectEqualStrings("ran ls", rec.summary.?);
+    try std.testing.expectEqualStrings("ls -la", rec.detail.?);
+}
+
+test "deserializeEvent invalid JSON" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(error.SyntaxError, deserializeEvent(allocator, "not json"));
+}
+
+test "deserializeEvent missing id" {
+    const allocator = std.testing.allocator;
+    const line = "{\"kind\":\"system\",\"severity\":\"info\",\"timestamp\":\"2026-01-01T00:00:00Z\"}";
+    try std.testing.expectError(error.MissingField, deserializeEvent(allocator, line));
+}
+
+test "loadEvents parses JSONL content" {
+    const allocator = std.testing.allocator;
+    const content =
+        \\{"id":"e1","kind":"agent_start","severity":"info","timestamp":"2026-01-01T00:00:00Z"}
+        \\{"id":"e2","kind":"tool_call","severity":"info","timestamp":"2026-01-01T00:00:01Z"}
+        \\{"id":"e3","kind":"agent_end","severity":"info","timestamp":"2026-01-01T00:00:02Z"}
+        \\
+    ;
+    const loaded = try loadEvents(allocator, content);
+    defer {
+        for (loaded) |*e| e.deinit(allocator);
+        allocator.free(loaded);
+    }
+
+    try std.testing.expectEqual(@as(usize, 3), loaded.len);
+    try std.testing.expectEqualStrings("e1", loaded[0].id);
+    try std.testing.expect(loaded[0].kind == .agent_start);
+    try std.testing.expectEqualStrings("e2", loaded[1].id);
+    try std.testing.expect(loaded[1].kind == .tool_call);
+    try std.testing.expectEqualStrings("e3", loaded[2].id);
+    try std.testing.expect(loaded[2].kind == .agent_end);
+}
+
+test "loadEvents empty content" {
+    const allocator = std.testing.allocator;
+    const loaded = try loadEvents(allocator, "");
+    defer allocator.free(loaded);
+    try std.testing.expectEqual(@as(usize, 0), loaded.len);
+}
+
+test "processEvent increments counters" {
+    var summary = SessionSummary{ .session_id = "s1" };
+
+    const e1 = EventRecord{ .id = "e1", .kind = .tool_call, .severity = .info, .timestamp = "t1", .duration_ns = 100 };
+    processEvent(&summary, &e1);
+    try std.testing.expectEqual(@as(usize, 1), summary.event_count);
+    try std.testing.expectEqual(@as(usize, 1), summary.tool_call_count);
+    try std.testing.expectEqual(@as(u64, 100), summary.total_duration_ns);
+    try std.testing.expectEqualStrings("t1", summary.first_timestamp.?);
+    try std.testing.expectEqualStrings("t1", summary.last_timestamp.?);
+
+    const e2 = EventRecord{ .id = "e2", .kind = .llm_request, .severity = .err, .timestamp = "t2" };
+    processEvent(&summary, &e2);
+    try std.testing.expectEqual(@as(usize, 2), summary.event_count);
+    try std.testing.expectEqual(@as(usize, 1), summary.error_count);
+    try std.testing.expectEqual(@as(usize, 1), summary.llm_request_count);
+    try std.testing.expectEqualStrings("t1", summary.first_timestamp.?);
+    try std.testing.expectEqualStrings("t2", summary.last_timestamp.?);
+
+    const e3 = EventRecord{ .id = "e3", .kind = .system, .severity = .warn, .timestamp = "t3" };
+    processEvent(&summary, &e3);
+    try std.testing.expectEqual(@as(usize, 1), summary.warning_count);
+}
+
+test "computeStats from event slice" {
+    const test_events = [_]EventRecord{
+        .{ .id = "e1", .kind = .agent_start, .timestamp = "2026-01-01T00:00:00Z" },
+        .{ .id = "e2", .kind = .tool_call, .timestamp = "2026-01-01T00:00:01Z", .duration_ns = 200_000_000 },
+        .{ .id = "e3", .kind = .llm_request, .timestamp = "2026-01-01T00:00:02Z", .duration_ns = 500_000_000 },
+        .{ .id = "e4", .kind = .err, .severity = .err, .timestamp = "2026-01-01T00:00:03Z" },
+        .{ .id = "e5", .kind = .agent_end, .severity = .warn, .timestamp = "2026-01-01T00:00:04Z" },
+    };
+    const stats = computeStats("sess-test", &test_events);
+
+    try std.testing.expectEqual(@as(usize, 5), stats.event_count);
+    try std.testing.expectEqual(@as(usize, 1), stats.error_count);
+    try std.testing.expectEqual(@as(usize, 1), stats.warning_count);
+    try std.testing.expectEqual(@as(usize, 1), stats.tool_call_count);
+    try std.testing.expectEqual(@as(usize, 1), stats.llm_request_count);
+    try std.testing.expectEqual(@as(u64, 700_000_000), stats.total_duration_ns);
+    try std.testing.expectEqualStrings("2026-01-01T00:00:00Z", stats.first_timestamp.?);
+    try std.testing.expectEqualStrings("2026-01-01T00:00:04Z", stats.last_timestamp.?);
+    try std.testing.expect(stats.hasErrors());
+    try std.testing.expect(stats.hasIssues());
+}
+
+test "serialize then deserialize roundtrip" {
+    const allocator = std.testing.allocator;
+    const original = EventRecord{
+        .id = "rt-001",
+        .kind = .tool_call,
+        .severity = .debug,
+        .timestamp = "2026-03-15T08:30:00Z",
+        .duration_ns = 123_456_789,
+        .correlation = .{ .session_id = "sess-rt", .task_id = "task-rt" },
+        .source = "test",
+        .summary = "roundtrip test",
+        .detail = "payload data",
+    };
+
+    // Serialize
+    var buf: [4096]u8 = undefined;
+    const line = events_store.serializeEvent(&buf, &original) orelse return error.SerializeFailed;
+
+    // Deserialize
+    const restored = try deserializeEvent(allocator, line);
+    defer restored.deinit(allocator);
+
+    try std.testing.expectEqualStrings(original.id, restored.id);
+    try std.testing.expect(original.kind == restored.kind);
+    try std.testing.expect(original.severity == restored.severity);
+    try std.testing.expectEqualStrings(original.timestamp, restored.timestamp);
+    try std.testing.expectEqual(original.duration_ns, restored.duration_ns);
+    try std.testing.expectEqualStrings("sess-rt", restored.correlation.session_id.?);
+    try std.testing.expectEqualStrings("task-rt", restored.correlation.task_id.?);
+    try std.testing.expectEqualStrings("test", restored.source.?);
+    try std.testing.expectEqualStrings("roundtrip test", restored.summary.?);
+    try std.testing.expectEqualStrings("payload data", restored.detail.?);
+}
+
+test "serialize write load computeStats roundtrip" {
+    const allocator = std.testing.allocator;
+    const test_path = "/tmp/nullclaw_replay_roundtrip_test.jsonl";
+    std.fs.cwd().deleteFile(test_path) catch {};
+    defer std.fs.cwd().deleteFile(test_path) catch {};
+
+    // Write events to JSONL file via EventStore
+    var store = events_store.EventStore{ .path = test_path };
+    const e1 = EventRecord{ .id = "r1", .kind = .agent_start, .timestamp = "2026-01-01T00:00:00Z" };
+    const e2 = EventRecord{ .id = "r2", .kind = .tool_call, .severity = .warn, .timestamp = "2026-01-01T00:00:01Z", .duration_ns = 300_000_000 };
+    const e3 = EventRecord{ .id = "r3", .kind = .llm_request, .timestamp = "2026-01-01T00:00:02Z", .duration_ns = 600_000_000 };
+    const e4 = EventRecord{ .id = "r4", .kind = .err, .severity = .err, .timestamp = "2026-01-01T00:00:03Z" };
+    store.append(&e1);
+    store.append(&e2);
+    store.append(&e3);
+    store.append(&e4);
+
+    // Load and parse
+    const content = try std.fs.cwd().readFileAlloc(allocator, test_path, 1024 * 1024);
+    defer allocator.free(content);
+    const loaded = try loadEvents(allocator, content);
+    defer {
+        for (loaded) |*e| e.deinit(allocator);
+        allocator.free(loaded);
+    }
+
+    try std.testing.expectEqual(@as(usize, 4), loaded.len);
+
+    // Compute stats
+    const stats = computeStats("roundtrip-sess", loaded);
+    try std.testing.expectEqual(@as(usize, 4), stats.event_count);
+    try std.testing.expectEqual(@as(usize, 1), stats.error_count);
+    try std.testing.expectEqual(@as(usize, 1), stats.warning_count);
+    try std.testing.expectEqual(@as(usize, 1), stats.tool_call_count);
+    try std.testing.expectEqual(@as(usize, 1), stats.llm_request_count);
+    try std.testing.expectEqual(@as(u64, 900_000_000), stats.total_duration_ns);
+    try std.testing.expectEqual(@as(u64, 900), stats.durationMs());
 }
