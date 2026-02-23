@@ -19,6 +19,7 @@ const tools_mod = @import("tools/root.zig");
 const memory_mod = @import("memory/root.zig");
 const observability = @import("observability.zig");
 const PairingGuard = @import("security/pairing.zig").PairingGuard;
+const log = std.log.scoped(.gateway);
 
 /// Maximum request body size (64KB) — prevents memory exhaustion.
 pub const MAX_BODY_SIZE: usize = 65_536;
@@ -459,42 +460,11 @@ pub fn extractBody(raw: []const u8) ?[]const u8 {
     return body;
 }
 
-/// Process an incoming message by spawning `nullclaw agent -m "..."`.
-/// Returns the agent's response text. Caller owns the returned memory.
-pub fn processIncomingMessage(allocator: std.mem.Allocator, message: []const u8) ![]u8 {
-    // Find our own executable path
-    var self_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const self_path = std.fs.selfExePath(&self_buf) catch "nullclaw";
+/// JSON error body returned when the session manager is not available.
+pub const SERVICE_UNAVAILABLE_BODY = "{\"error\":\"service_unavailable\",\"message\":\"Session manager not initialized\"}";
 
-    var child = std.process.Child.init(
-        &[_][]const u8{ self_path, "agent", "-m", message },
-        allocator,
-    );
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Pipe;
-
-    try child.spawn();
-
-    // Read stdout
-    var stdout_buf: std.ArrayList(u8) = .empty;
-    defer stdout_buf.deinit(allocator);
-
-    const stdout_reader = child.stdout.?;
-    var read_buf: [4096]u8 = undefined;
-    while (true) {
-        const n = stdout_reader.read(&read_buf) catch break;
-        if (n == 0) break;
-        try stdout_buf.appendSlice(allocator, read_buf[0..n]);
-    }
-
-    const term = try child.wait();
-    _ = term;
-
-    if (stdout_buf.items.len > 0) {
-        return try allocator.dupe(u8, stdout_buf.items);
-    }
-    return try allocator.dupe(u8, "No response from agent");
-}
+/// HTTP status string for 503 responses.
+pub const SERVICE_UNAVAILABLE_STATUS = "503 Service Unavailable";
 
 /// Run the HTTP gateway. Binds to host:port and serves HTTP requests.
 /// Endpoints: GET /health, GET /ready, POST /pair, POST /webhook
@@ -557,6 +527,13 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16) !void {
             session_mgr_opt = session_mod.SessionManager.init(allocator, cfg, provider_i, tools_slice, mem_opt, obs);
         }
     }
+    // Register session_mgr health so /ready reflects its availability
+    if (session_mgr_opt != null) {
+        health.markComponentOk("session_mgr");
+    } else {
+        health.markComponentError("session_mgr", "session manager not initialized");
+    }
+
     if (state.pairing_guard == null) {
         state.pairing_guard = try PairingGuard.init(allocator, true, &.{});
     }
@@ -672,7 +649,9 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16) !void {
                                     response_body = "{\"status\":\"received\"}";
                                 }
                             } else {
-                                response_body = "{\"status\":\"received\"}";
+                                log.warn("webhook rejected: session manager not initialized", .{});
+                                response_status = SERVICE_UNAVAILABLE_STATUS;
+                                response_body = SERVICE_UNAVAILABLE_BODY;
                             }
                         } else {
                             response_body = "{\"status\":\"received\"}";
@@ -1233,4 +1212,61 @@ test "handleReady recovered component shows healthy" {
     defer if (resp.allocated) std.testing.allocator.free(@constCast(resp.body));
     try std.testing.expectEqualStrings("200 OK", resp.http_status);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"healthy\":true") != null);
+}
+
+// ── Service unavailable / session_mgr tests ──────────────────────────
+
+test "SERVICE_UNAVAILABLE_BODY contains error and message fields" {
+    const body = SERVICE_UNAVAILABLE_BODY;
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"error\":\"service_unavailable\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"message\":\"Session manager not initialized\"") != null);
+}
+
+test "SERVICE_UNAVAILABLE_STATUS is 503" {
+    try std.testing.expectEqualStrings("503 Service Unavailable", SERVICE_UNAVAILABLE_STATUS);
+}
+
+test "SERVICE_UNAVAILABLE_BODY is valid JSON structure" {
+    const body = SERVICE_UNAVAILABLE_BODY;
+    try std.testing.expect(body.len > 0);
+    try std.testing.expectEqual(@as(u8, '{'), body[0]);
+    try std.testing.expectEqual(@as(u8, '}'), body[body.len - 1]);
+}
+
+test "handleReady session_mgr error causes not_ready" {
+    health.reset();
+    health.markComponentOk("gateway");
+    health.markComponentError("session_mgr", "session manager not initialized");
+    const resp = handleReady(std.testing.allocator);
+    defer if (resp.allocated) std.testing.allocator.free(@constCast(resp.body));
+    try std.testing.expectEqualStrings("503 Service Unavailable", resp.http_status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"status\":\"not_ready\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"session_mgr\"") != null);
+}
+
+test "handleReady session_mgr healthy causes ready" {
+    health.reset();
+    health.markComponentOk("gateway");
+    health.markComponentOk("session_mgr");
+    const resp = handleReady(std.testing.allocator);
+    defer if (resp.allocated) std.testing.allocator.free(@constCast(resp.body));
+    try std.testing.expectEqualStrings("200 OK", resp.http_status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"status\":\"ready\"") != null);
+}
+
+test "handleReady session_mgr recovery transitions to ready" {
+    health.reset();
+    health.markComponentOk("gateway");
+    health.markComponentError("session_mgr", "session manager not initialized");
+
+    // Should be not_ready
+    const resp1 = handleReady(std.testing.allocator);
+    defer if (resp1.allocated) std.testing.allocator.free(@constCast(resp1.body));
+    try std.testing.expectEqualStrings("503 Service Unavailable", resp1.http_status);
+
+    // Recover
+    health.markComponentOk("session_mgr");
+    const resp2 = handleReady(std.testing.allocator);
+    defer if (resp2.allocated) std.testing.allocator.free(@constCast(resp2.body));
+    try std.testing.expectEqualStrings("200 OK", resp2.http_status);
 }
